@@ -1,0 +1,30 @@
+# House style: Java-like braces, 4-space indent, 140 columns.
+#
+# No premade style matches. LLVM is the closest base worth building on: it
+# already attaches braces AND already forbids single-line ifs/loops/blocks.
+# (Google looks closer at a glance but is the trap — it is the one common
+# preset that explicitly permits `if (x) return;` and single-line loops.)
+#
+# The short-statement keys below are already LLVM defaults. They are pinned
+# anyway because they are the whole point of this file, and a future default
+# change should not quietly reintroduce one-line control flow.
+#
+# InsertBraces is opt-in in every preset: it makes the formatter *add* braces
+# to unbraced bodies, so the always-brace rule is mechanical rather than a
+# review burden.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 140
+BreakBeforeBraces: Attach
+BreakAfterReturnType: None
+InsertBraces: true
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: None
+AllowShortCaseLabelsOnASingleLine: false
+AlignAfterOpenBracket: Align
+IndentCaseLabels: false
+PointerAlignment: Right
+SpaceAfterCStyleCast: true
+SortIncludes: false

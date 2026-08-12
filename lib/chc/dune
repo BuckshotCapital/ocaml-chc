@@ -1,0 +1,11 @@
+(library
+ (name chc)
+ (libraries unix)
+ (foreign_stubs
+  (language c)
+  (names chc_stubs)
+  (include_dirs %{project_root}/vendor/clickhouse-c)
+  ; The CHC_* configuration macros live in chc_stubs.c so the translation unit
+  ; is self-describing; setting them here too only earns -Wmacro-redefined.
+  (flags
+   (:standard -std=c11))))

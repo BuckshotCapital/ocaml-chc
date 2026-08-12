@@ -1,0 +1,4 @@
+# Vendored upstream sources — never reformat. Keeping them byte-identical to
+# the pinned commit is what makes re-vendoring a reviewable diff.
+DisableFormat: true
+SortIncludes: false
