@@ -3,19 +3,31 @@
 OCaml bindings to [clickhouse-c](https://github.com/ClickHouse/clickhouse-c),
 ClickHouse's header-only C client for the Native wire format.
 
-**Status: stage 1.** Block decoding from a file descriptor works and is tested
-against real `clickhouse local` output. There is no TCP client yet.
+**Status: stage 2.** Queries over the native TCP protocol work, as does block
+decoding from a file descriptor. Tested against a live ClickHouse 26.5 and
+against `clickhouse local` output. No INSERT path and no compression yet.
 
 ```ocaml
-let fd = Unix.openfile "dump.native" [ Unix.O_RDONLY ] 0 in
-let r = Chc.open_fd fd in
-Chc.iter r (fun b ->
-    for i = 0 to Chc.n_columns b - 1 do
-      Printf.printf "%s : %s\n" (Chc.column_name b i) (Chc.column_type_name b i);
-      Array.iter
-        (fun v -> print_endline (Chc.string_of_value v))
-        (Chc.column b i)
-    done);
+let c = Chc.Client.connect ~password "clickhouse.internal" in
+let names, rows = Chc.Client.query_rows c "SELECT name, engine FROM system.tables LIMIT 10" in
+Array.iter (fun row ->
+    print_endline (String.concat " | " (Array.to_list (Array.map Chc.string_of_value row))))
+  rows;
+Chc.Client.close c
+```
+
+Streaming, for results that should not be materialised:
+
+```ocaml
+Chc.Client.query_iter c "SELECT number FROM numbers(10_000_000)" ~f:(fun b ->
+    Array.iter consume (Chc.column b 0))
+```
+
+Reading `FORMAT Native` bytes off a descriptor, with no server involved:
+
+```ocaml
+let r = Chc.open_fd (Unix.openfile "dump.native" [ Unix.O_RDONLY ] 0) in
+Chc.iter r (fun b -> ...);
 Chc.close r
 ```
 
@@ -77,6 +89,13 @@ make fmt         # ocamlformat via `dune fmt`, plus clang-format on the stubs
 make fmt-check   # same, non-mutating; suitable for CI
 ```
 
+`test/test_decode.ml` is hermetic — it drives `clickhouse local`, which the
+flake supplies. `test/test_client.ml` needs a live server and is opt-in via
+`CHC_TEST_HOST`; unset, it reports skipped and passes, so a checkout with no
+server still builds green. It runs only against `numbers()` and literals, so it
+works on any server and hardcodes nothing about one. Put real credentials in
+`.envrc.local` (gitignored).
+
 The flake pins OCaml 5.4 and ClickHouse 26.7 (cached for aarch64-darwin, so it
 downloads rather than builds). Point `CLICKHOUSE_BIN` at another binary to test
 against a different version.
@@ -95,11 +114,24 @@ The directory carries its own `.clang-format` with `DisableFormat: true`:
 keeping the headers byte-identical to the pinned commit is what makes a
 re-vendor a reviewable diff.
 
+## Schema-only blocks
+
+Every TCP query response opens with a block that has column names and types,
+zero rows, and — importantly — no column tree at all: `chc_block_column`
+returns `NULL`. `Chc.column` returns `[||]` for it rather than dereferencing
+that, and `Chc.column_layout` raises. `query_iter` passes the block through
+instead of hiding it, since it is the cheapest way to learn a result's schema.
+
 ## Roadmap
 
 1. ~~Block decoder over an fd, no TCP.~~ Done.
-2. Async client over OCaml sockets: handshake, query, block streaming, via
-   `clickhouse-async.h`.
+2. ~~Async client over OCaml sockets: handshake, query, block streaming, via
+   `clickhouse-async.h`.~~ Done.
 3. Wide types: 128/256-bit integers and decimals, `UUID`, `IPv6` as first-class
    values.
-4. Insert path (`chc_block_builder`) and compression.
+4. Insert path (`chc_block_builder`).
+5. Compression — now just a flag: link lz4/zstd, drop `CHC_NO_*`, call
+   `chc_lz4_codec_init`, set `chc_client_opts.codec`. The client negotiates
+   `CHC_COMP_NONE` while `codec` is NULL, which is why the uncompressed path
+   needed no codec linked.
+6. Lwt / Eio drivers — replace `Chc.Client`'s pump, reuse everything else.

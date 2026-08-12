@@ -129,9 +129,14 @@ val column_name : block -> int -> string
 val column_type_name : block -> int -> string
 
 val column_kind : block -> int -> Kind.t
+
+(** @raise Invalid_argument on a schema-only block, which has no column tree. See {!column}. *)
 val column_layout : block -> int -> Layout.t
 
-(** Decode column [i] in full. Values are OCaml-owned, so they outlive the block; nothing aliases C memory. *)
+(** Decode column [i] in full. Values are OCaml-owned, so they outlive the block; nothing aliases C memory.
+
+    Returns [[||]] for a schema-only block. The TCP path opens every query response with one: it carries column
+    names and types but zero rows and no column tree, which is exactly what makes it useful. *)
 val column : block -> int -> value array
 
 val columns : block -> value array array
@@ -171,3 +176,141 @@ val close : reader -> unit
 val iter : reader -> (block -> unit) -> unit
 
 val fold : reader -> init:'a -> f:('a -> block -> 'a) -> 'a
+
+(** {1 Async client}
+
+    The sans-IO core: it never touches a socket. Feed it inbound bytes with
+    {!Async.submit}, drain outbound bytes with {!Async.pending_out} /
+    {!Async.consume_out}, and drive it from whatever reactor you like. {!Client}
+    is a blocking driver built on this; an Lwt or Eio one would replace only the
+    pump. *)
+
+module Async : sig
+  type t
+
+  type exn_info =
+    { code : int
+    ; name : string
+    ; display_text : string
+    ; stack_trace : string
+    }
+
+  type progress =
+    { rows : int
+    ; bytes : int
+    ; total_rows : int
+    ; written_rows : int (** 0 below server revision 54420 *)
+    ; written_bytes : int
+    }
+
+  type profile_info =
+    { p_rows : int
+    ; p_blocks : int
+    ; p_bytes : int
+    ; rows_before_limit : int
+    ; applied_limit : bool
+    ; calculated_rows_before_limit : bool
+    }
+
+  type server_info =
+    { server_name : string
+    ; timezone : string
+    ; display_name : string
+    ; version_major : int
+    ; version_minor : int
+    ; version_patch : int
+    ; revision : int (** negotiated: [min (client, server)] *)
+    }
+
+  type packet =
+    | Pong
+    | End_of_stream
+    | Table_columns
+    | Hello
+    | Data of block
+    | Totals of block
+    | Extremes of block
+    | Log of block
+    | Profile_events of block
+    | Exception of exn_info
+    (** Server-side errors arrive as this packet, not as a raised
+            {!Error} — only transport failures raise. *)
+    | Progress of progress
+    | Profile_info of profile_info
+
+  (** Allocates only; performs no I/O and cannot fail on the network. *)
+  val create : ?client_name:string -> ?database:string -> ?user:string -> ?password:string -> ?read_buffer_bytes:int -> unit -> t
+
+  (** [true] once the Hello exchange completes. [false] means the input buffer
+      drained mid-parse: submit more bytes and call again. Parse state survives
+      the retry. *)
+  val handshake : t -> bool
+
+  (** Appends to the out buffer; never blocks. *)
+  val send_query : t -> ?query_id:string -> string -> unit
+
+  (** Appends the empty block terminating an INSERT row stream. *)
+  val send_data_end : t -> unit
+
+  (** [None] means the input buffer drained mid-parse — submit more bytes and
+      retry. A Data block spread over many reads resumes at the in-progress
+      column rather than re-parsing. *)
+  val recv_packet : t -> packet option
+
+  (** [submit t buf n] feeds the first [n] bytes of [buf] as inbound socket
+      data. Copied internally. *)
+  val submit : t -> Bytes.t -> int -> unit
+
+  (** Bytes the client wants written to the socket; [""] when idle. *)
+  val pending_out : t -> string
+
+  (** Report how many of {!pending_out}'s bytes the socket actually accepted; a
+      partial write is fine. There is no write backpressure — sends never block
+      and grow the out buffer, so watch its length if you pipeline. *)
+  val consume_out : t -> int -> unit
+
+  (** Meaningful only after {!handshake} returns [true]. *)
+  val server_info : t -> server_info
+
+  val close : t -> unit
+end
+
+(** {1 Blocking client} *)
+
+module Client : sig
+  type t
+
+  (** Connect over the native TCP protocol (default port 9000) and complete the
+      handshake. TLS is not handled here: terminate it in OCaml and drive
+      {!Async} directly.
+
+      @raise Error on handshake or authentication failure. *)
+  val connect
+    :  ?port:int
+    -> ?database:string
+    -> ?user:string
+    -> ?password:string
+    -> ?client_name:string
+    -> ?read_buffer_bytes:int
+    -> ?socket_buffer_bytes:int
+    -> string
+    -> t
+
+  (** Run [sql] and apply [f] to each Data block carrying columns, draining the
+      response to end-of-stream. The first block normally has zero rows and
+      exists to carry the schema; it is passed through rather than hidden.
+
+      @raise Error with [server_code] set if the server returns an exception. *)
+  val query_iter : t -> string -> f:(block -> unit) -> unit
+
+  val query_fold : t -> string -> init:'a -> f:('a -> block -> 'a) -> 'a
+  val query : t -> string -> block list
+
+  (** Column names plus every row decoded, flattened across blocks. Convenient
+      for small results; use {!query_iter} to stream. *)
+  val query_rows : t -> string -> string array * value array array
+
+  val ping : t -> unit
+  val server_info : t -> Async.server_info
+  val close : t -> unit
+end

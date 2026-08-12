@@ -430,8 +430,30 @@ let n_columns = blk_n_columns
 let column_name = blk_column_name
 let column_type_name b i = ty_format b (blk_type_ptr b i)
 let column_kind b i = Kind.of_int (ty_kind b (blk_type_ptr b i))
-let column_layout b i = Layout.of_int (col_layout b (blk_column_ptr b i))
-let column b i = decode_col b (Tnode (blk_type_ptr b i)) (blk_column_ptr b i)
+
+(* The TCP path opens a query response with a schema-only block: column names
+   and types are present, n_rows is 0, and clickhouse-c allocates no column
+   tree at all, so chc_block_column hands back NULL. Treat that as an empty
+   column rather than letting a null pointer reach the decoder — but only when
+   the block really has no rows, since a null tree over a non-empty block would
+   be a genuine protocol bug worth surfacing. *)
+let is_schema_only b i = blk_column_ptr b i = 0n
+
+let column_layout b i =
+  if is_schema_only b i
+  then invalid_arg (Printf.sprintf "Chc.column_layout: column %d is schema-only (block has no rows)" i)
+  else Layout.of_int (col_layout b (blk_column_ptr b i))
+;;
+
+let column b i =
+  let ptr = blk_column_ptr b i in
+  if ptr <> 0n
+  then decode_col b (Tnode (blk_type_ptr b i)) ptr
+  else if blk_n_rows b = 0
+  then [||]
+  else invalid_arg (Printf.sprintf "Chc.column: column %d has no data tree but the block has %d rows" i (blk_n_rows b))
+;;
+
 let columns b = Array.init (n_columns b) (column b)
 
 let rows b =
@@ -494,3 +516,267 @@ let fold r ~init ~f =
   in
   go init
 ;;
+
+(* -------------------------------------------------------------------------- *)
+(* Async client — sans-IO                                                     *)
+(* -------------------------------------------------------------------------- *)
+
+module Async = struct
+  type handle
+
+  type exn_info =
+    { code : int
+    ; name : string
+    ; display_text : string
+    ; stack_trace : string
+    }
+
+  type progress =
+    { rows : int
+    ; bytes : int
+    ; total_rows : int
+    ; written_rows : int
+    ; written_bytes : int
+    }
+
+  type profile_info =
+    { p_rows : int
+    ; p_blocks : int
+    ; p_bytes : int
+    ; rows_before_limit : int
+    ; applied_limit : bool
+    ; calculated_rows_before_limit : bool
+    }
+
+  type server_info =
+    { server_name : string
+    ; timezone : string
+    ; display_name : string
+    ; version_major : int
+    ; version_minor : int
+    ; version_patch : int
+    ; revision : int
+    }
+
+  (* Declaration order is load-bearing: the PKT_CONST_* and PKT_TAG_* enums in
+     chc_stubs.c mirror it. OCaml numbers constant and non-constant
+     constructors in two independent sequences, so the two groups below are
+     each numbered from zero. Do not reorder without updating the stubs. *)
+  type packet =
+    | Pong
+    | End_of_stream
+    | Table_columns
+    | Hello
+    | Data of block
+    | Totals of block
+    | Extremes of block
+    | Log of block
+    | Profile_events of block
+    | Exception of exn_info
+    | Progress of progress
+    | Profile_info of profile_info
+
+  external create_raw : string -> string -> string -> string -> int -> handle = "chc_stub_async_create"
+  external close_raw : handle -> unit = "chc_stub_async_close"
+  external handshake_raw : handle -> bool = "chc_stub_async_handshake"
+  external send_query_raw : handle -> string -> string -> unit = "chc_stub_async_send_query"
+  external send_data_end_raw : handle -> unit = "chc_stub_async_send_data_end"
+  external submit_raw : handle -> Bytes.t -> int -> unit = "chc_stub_async_submit"
+  external pending_out_raw : handle -> string = "chc_stub_async_pending_out"
+  external consume_out_raw : handle -> int -> unit = "chc_stub_async_consume_out"
+  external server_info_raw : handle -> server_info = "chc_stub_async_server_info"
+  external recv_packet_raw : handle -> packet option = "chc_stub_async_recv_packet"
+
+  type t =
+    { h : handle
+    ; mutable closed : bool
+    }
+
+  let create ?(client_name = "ocaml-chc") ?(database = "default") ?(user = "default") ?(password = "") ?(read_buffer_bytes = 0) () =
+    { h = create_raw client_name database user password read_buffer_bytes; closed = false }
+  ;;
+
+  let check t = if t.closed then invalid_arg "Chc.Async: client is closed"
+
+  let close t =
+    if not t.closed
+    then (
+      t.closed <- true;
+      close_raw t.h)
+  ;;
+
+  let handshake t =
+    check t;
+    handshake_raw t.h
+  ;;
+
+  let send_query t ?(query_id = "") sql =
+    check t;
+    send_query_raw t.h sql query_id
+  ;;
+
+  let send_data_end t =
+    check t;
+    send_data_end_raw t.h
+  ;;
+
+  let submit t buf len =
+    check t;
+    submit_raw t.h buf len
+  ;;
+
+  let pending_out t =
+    check t;
+    pending_out_raw t.h
+  ;;
+
+  let consume_out t n =
+    check t;
+    consume_out_raw t.h n
+  ;;
+
+  let server_info t =
+    check t;
+    server_info_raw t.h
+  ;;
+
+  let recv_packet t =
+    check t;
+    recv_packet_raw t.h
+  ;;
+end
+
+(* -------------------------------------------------------------------------- *)
+(* Client — blocking driver over Unix sockets                                 *)
+(* -------------------------------------------------------------------------- *)
+
+module Client = struct
+  type t =
+    { sock : Unix.file_descr
+    ; a : Async.t
+    ; buf : Bytes.t
+    ; mutable closed : bool
+    }
+
+  let server_error where (e : Async.exn_info) =
+    raise (Error { code = 0; server_code = e.code; msg = (if e.display_text = "" then where else e.display_text); server_name = e.name })
+  ;;
+
+  let eof_error () = raise (Error { code = 1 (* CHC_ERR_IO *); server_code = 0; msg = "connection closed by peer"; server_name = "" })
+
+  (* One turn of the reactor: flush everything the client wants to send before
+     reading, otherwise a query sitting in the out buffer deadlocks against a
+     server that is waiting for it. *)
+  let pump t =
+    let out = Async.pending_out t.a in
+    let len = String.length out in
+    if len > 0
+    then (
+      let n = Unix.write_substring t.sock out 0 len in
+      Async.consume_out t.a n)
+    else (
+      let n = Unix.read t.sock t.buf 0 (Bytes.length t.buf) in
+      if n = 0 then eof_error ();
+      Async.submit t.a t.buf n)
+  ;;
+
+  let resolve host port =
+    match Unix.getaddrinfo host (string_of_int port) [ Unix.AI_SOCKTYPE Unix.SOCK_STREAM ] with
+    | [] -> invalid_arg (Printf.sprintf "Chc.Client.connect: cannot resolve %s:%d" host port)
+    | ai :: _ -> ai
+  ;;
+
+  let connect
+        ?(port = 9000)
+        ?(database = "default")
+        ?(user = "default")
+        ?(password = "")
+        ?(client_name = "ocaml-chc")
+        ?(read_buffer_bytes = 0)
+        ?(socket_buffer_bytes = 65536)
+        host
+    =
+    let ai = resolve host port in
+    let sock = Unix.socket ai.Unix.ai_family ai.Unix.ai_socktype ai.Unix.ai_protocol in
+    (try Unix.connect sock ai.Unix.ai_addr with
+     | e ->
+       Unix.close sock;
+       raise e);
+    Unix.setsockopt sock Unix.TCP_NODELAY true;
+    let a = Async.create ~client_name ~database ~user ~password ~read_buffer_bytes () in
+    let t = { sock; a; buf = Bytes.create socket_buffer_bytes; closed = false } in
+    let rec drive () =
+      if Async.handshake t.a
+      then ()
+      else (
+        pump t;
+        drive ())
+    in
+    (try drive () with
+     | e ->
+       Async.close a;
+       Unix.close sock;
+       raise e);
+    t
+  ;;
+
+  let check t = if t.closed then invalid_arg "Chc.Client: connection is closed"
+
+  let close t =
+    if not t.closed
+    then (
+      t.closed <- true;
+      Async.close t.a;
+      Unix.close t.sock)
+  ;;
+
+  let server_info t =
+    check t;
+    Async.server_info t.a
+  ;;
+
+  (* Drains the response stream to End_of_stream, handing every Data block that
+     carries columns to [f]. The first such block normally has zero rows and
+     exists to carry the schema, so it is passed through rather than hidden. *)
+  let query_iter t sql ~f =
+    check t;
+    Async.send_query t.a sql;
+    let rec loop () =
+      match Async.recv_packet t.a with
+      | None ->
+        pump t;
+        loop ()
+      | Some Async.End_of_stream -> ()
+      | Some (Async.Data b) ->
+        if n_columns b > 0 then f b;
+        loop ()
+      | Some (Async.Exception e) -> server_error "query failed" e
+      | Some _ -> loop ()
+    in
+    loop ()
+  ;;
+
+  let query_fold t sql ~init ~f =
+    let acc = ref init in
+    query_iter t sql ~f:(fun b -> acc := f !acc b);
+    !acc
+  ;;
+
+  let query t sql = List.rev (query_fold t sql ~init:[] ~f:(fun acc b -> b :: acc))
+
+  (* Every row of every block, decoded, with the column names from the header. *)
+  let query_rows t sql =
+    let names = ref [||] in
+    let out =
+      query_fold t sql ~init:[] ~f:(fun acc b ->
+        if Array.length !names = 0 then names := Array.init (n_columns b) (column_name b);
+        if n_rows b = 0 then acc else List.rev_append (Array.to_list (rows b)) acc)
+    in
+    !names, Array.of_list (List.rev out)
+  ;;
+
+  let ping t =
+    check t;
+    ignore (query t "SELECT 1")
+  ;;
+end

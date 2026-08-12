@@ -21,6 +21,13 @@
 #include "clickhouse.h"
 #include "clickhouse-posix-io.h"
 
+/* clickhouse-client.h pulls in clickhouse-compression.h, which is why the
+ * CHC_NO_* guards above are load-bearing: without them it wants lz4.h/zstd.h.
+ * The client negotiates CHC_COMP_NONE whenever opts->codec is NULL, so the
+ * uncompressed TCP path needs no codec linked. */
+#include "clickhouse-client.h"
+#include "clickhouse-async.h"
+
 #include <caml/alloc.h>
 #include <caml/callback.h>
 #include <caml/custom.h>
@@ -501,4 +508,311 @@ CAMLprim value chc_stub_col_lc_dict(value vb, value vc) {
     CAMLparam2(vb, vc);
     const chc_column *d = chc_column_lc_dict(Col_ptr(vc));
     CAMLreturn(caml_copy_nativeint((intnat) (uintptr_t) d));
+}
+
+/* -------------------------------------------------------------------------- */
+/* Async client                                                               */
+/* -------------------------------------------------------------------------- */
+
+/* These tags MUST match the declaration order of Chc.Async.packet in chc.ml.
+ * OCaml numbers constant and non-constant constructors in two independent
+ * sequences, each in source order, so the two blocks below are separate. */
+enum {
+    PKT_CONST_PONG = 0,
+    PKT_CONST_END_OF_STREAM = 1,
+    PKT_CONST_TABLE_COLUMNS = 2,
+    PKT_CONST_HELLO = 3,
+};
+enum {
+    PKT_TAG_DATA = 0,
+    PKT_TAG_TOTALS = 1,
+    PKT_TAG_EXTREMES = 2,
+    PKT_TAG_LOG = 3,
+    PKT_TAG_PROFILE_EVENTS = 4,
+    PKT_TAG_EXCEPTION = 5,
+    PKT_TAG_PROGRESS = 6,
+    PKT_TAG_PROFILE_INFO = 7,
+};
+
+typedef struct {
+    chc_async_client *c;
+    /* The client keeps this allocator BY POINTER (clickhouse-async.h:124,
+     * `c->cli.al = al`) rather than copying it, so it has to outlive the
+     * client. Passing a stack chc_alloc to init would be a use-after-free. */
+    chc_alloc al;
+    int open;
+} chc_async_box;
+
+#define Async_val(v) (*((chc_async_box **) Data_custom_val(v)))
+
+static void async_finalize(value v) {
+    chc_async_box *box = Async_val(v);
+    if (box == NULL) {
+        return;
+    }
+    if (box->open && box->c) {
+        chc_async_client_free(box->c);
+    }
+    free(box);
+    Async_val(v) = NULL;
+}
+
+static struct custom_operations async_ops = {
+    "chc.async",
+    async_finalize,
+    custom_compare_default,
+    custom_hash_default,
+    custom_serialize_default,
+    custom_deserialize_default,
+    custom_compare_ext_default,
+    custom_fixed_length_default,
+};
+
+static chc_async_box *async_of(value v) {
+    chc_async_box *box = Async_val(v);
+    if (box == NULL || !box->open) {
+        caml_invalid_argument("Chc.Async: client is closed");
+    }
+    return box;
+}
+
+CAMLprim value chc_stub_async_create(value vname, value vdb, value vuser, value vpass, value vbufsz) {
+    CAMLparam5(vname, vdb, vuser, vpass, vbufsz);
+    CAMLlocal1(v);
+
+    chc_async_box *box = calloc(1, sizeof *box);
+    if (box == NULL) {
+        caml_raise_out_of_memory();
+    }
+    box->al = chc_alloc_stdlib();
+
+    /* Hello strings are copied internally, so these borrows only need to be
+     * valid for the duration of the call. No OCaml allocation happens inside
+     * init (it allocates through chc_alloc, i.e. malloc), so the GC cannot
+     * move them underneath it. */
+    chc_client_opts opts = {0};
+    opts.client_name = String_val(vname);
+    opts.database = String_val(vdb);
+    opts.user = String_val(vuser);
+    opts.password = String_val(vpass);
+    opts.read_buffer_bytes = (size_t) Long_val(vbufsz);
+
+    chc_err err = {0};
+    if (chc_async_client_init(&box->c, &opts, &box->al, &err) != CHC_OK) {
+        free(box);
+        chc_raise_error(CHC_ERR_USAGE, &err);
+    }
+    box->open = 1;
+
+    v = caml_alloc_custom_mem(&async_ops, sizeof(chc_async_box *), sizeof *box);
+    Async_val(v) = box;
+    CAMLreturn(v);
+}
+
+CAMLprim value chc_stub_async_close(value vh) {
+    CAMLparam1(vh);
+    chc_async_box *box = Async_val(vh);
+    if (box && box->open) {
+        chc_async_client_free(box->c);
+        box->c = NULL;
+        box->open = 0;
+    }
+    CAMLreturn(Val_unit);
+}
+
+/* true = handshake complete, false = needs more inbound bytes. */
+CAMLprim value chc_stub_async_handshake(value vh) {
+    CAMLparam1(vh);
+    chc_async_box *box = async_of(vh);
+    chc_err err = {0};
+    int rc = chc_async_handshake(box->c, &err);
+    if (rc == CHC_OK) {
+        CAMLreturn(Val_true);
+    }
+    if (rc == CHC_WOULD_BLOCK) {
+        CAMLreturn(Val_false);
+    }
+    chc_raise_error(rc, &err);
+    CAMLreturn(Val_false); /* unreachable */
+}
+
+CAMLprim value chc_stub_async_send_query(value vh, value vsql, value vqid) {
+    CAMLparam3(vh, vsql, vqid);
+    chc_async_box *box = async_of(vh);
+    chc_err err = {0};
+    if (chc_async_send_query(box->c, String_val(vsql), caml_string_length(vsql), String_val(vqid), caml_string_length(vqid), &err) !=
+        CHC_OK) {
+        chc_raise_error(CHC_ERR_PROTOCOL, &err);
+    }
+    CAMLreturn(Val_unit);
+}
+
+/* Terminates a query's data stream (and an INSERT's rows) with an empty block. */
+CAMLprim value chc_stub_async_send_data_end(value vh) {
+    CAMLparam1(vh);
+    chc_async_box *box = async_of(vh);
+    chc_err err = {0};
+    if (chc_async_send_data_end(box->c, &err) != CHC_OK) {
+        chc_raise_error(CHC_ERR_PROTOCOL, &err);
+    }
+    CAMLreturn(Val_unit);
+}
+
+/* Inbound socket bytes. chc_in_submit copies into the client's own buffer, and
+ * allocates through chc_alloc rather than the OCaml heap, so handing it a
+ * pointer into vbuf is safe for the duration of the call. */
+CAMLprim value chc_stub_async_submit(value vh, value vbuf, value vlen) {
+    CAMLparam3(vh, vbuf, vlen);
+    chc_async_box *box = async_of(vh);
+    chc_err err = {0};
+    if (chc_async_submit(box->c, Bytes_val(vbuf), (size_t) Long_val(vlen), &err) != CHC_OK) {
+        chc_raise_error(CHC_ERR_IO, &err);
+    }
+    CAMLreturn(Val_unit);
+}
+
+CAMLprim value chc_stub_async_pending_out(value vh) {
+    CAMLparam1(vh);
+    chc_async_box *box = async_of(vh);
+    const uint8_t *buf = NULL;
+    size_t len = 0;
+    chc_async_pending_out(box->c, &buf, &len);
+    CAMLreturn(caml_alloc_initialized_string(len, buf ? (const char *) buf : ""));
+}
+
+CAMLprim value chc_stub_async_consume_out(value vh, value vn) {
+    CAMLparam2(vh, vn);
+    chc_async_box *box = async_of(vh);
+    chc_async_consume_out(box->c, (size_t) Long_val(vn));
+    CAMLreturn(Val_unit);
+}
+
+CAMLprim value chc_stub_async_server_info(value vh) {
+    CAMLparam1(vh);
+    CAMLlocal4(rec, s_name, s_tz, s_disp);
+    chc_async_box *box = async_of(vh);
+    const chc_server_info *si = chc_async_server_info(box->c);
+
+    s_name = caml_copy_string(si ? si->name : "");
+    s_tz = caml_copy_string(si ? si->timezone : "");
+    s_disp = caml_copy_string(si ? si->display_name : "");
+
+    rec = caml_alloc(7, 0);
+    Store_field(rec, 0, s_name);
+    Store_field(rec, 1, s_tz);
+    Store_field(rec, 2, s_disp);
+    Store_field(rec, 3, Val_long(si ? (long) si->version_major : 0));
+    Store_field(rec, 4, Val_long(si ? (long) si->version_minor : 0));
+    Store_field(rec, 5, Val_long(si ? (long) si->version_patch : 0));
+    Store_field(rec, 6, Val_long(si ? (long) si->revision : 0));
+    CAMLreturn(rec);
+}
+
+/* Returns None when the input buffer drained mid-parse (submit more bytes and
+ * retry — parse state is preserved), Some packet otherwise. Server-side errors
+ * arrive as a CHC_PKT_EXCEPTION packet with CHC_OK, not as a hard failure. */
+CAMLprim value chc_stub_async_recv_packet(value vh) {
+    CAMLparam1(vh);
+    CAMLlocal5(res, pay, inner, s1, s2);
+    CAMLlocal1(s3);
+
+    chc_async_box *box = async_of(vh);
+    chc_packet pkt = {0};
+    chc_err err = {0};
+
+    int rc = chc_async_recv_packet(box->c, &pkt, &err);
+    if (rc == CHC_WOULD_BLOCK) {
+        CAMLreturn(Val_int(0)); /* None */
+    }
+    if (rc != CHC_OK) {
+        chc_raise_error(rc, &err);
+    }
+
+    int block_tag = -1;
+    int const_tag = -1;
+    switch (pkt.kind) {
+    case CHC_PKT_DATA:
+        block_tag = PKT_TAG_DATA;
+        break;
+    case CHC_PKT_TOTALS:
+        block_tag = PKT_TAG_TOTALS;
+        break;
+    case CHC_PKT_EXTREMES:
+        block_tag = PKT_TAG_EXTREMES;
+        break;
+    case CHC_PKT_LOG:
+        block_tag = PKT_TAG_LOG;
+        break;
+    case CHC_PKT_PROFILE_EVENTS:
+        block_tag = PKT_TAG_PROFILE_EVENTS;
+        break;
+    case CHC_PKT_PONG:
+        const_tag = PKT_CONST_PONG;
+        break;
+    case CHC_PKT_END_OF_STREAM:
+        const_tag = PKT_CONST_END_OF_STREAM;
+        break;
+    case CHC_PKT_TABLE_COLUMNS:
+        const_tag = PKT_CONST_TABLE_COLUMNS;
+        break;
+    case CHC_PKT_HELLO:
+        const_tag = PKT_CONST_HELLO;
+        break;
+    default:
+        break;
+    }
+
+    if (block_tag >= 0) {
+        chc_block *b = pkt.block;
+        pkt.block = NULL; /* take ownership before clearing */
+        chc_async_packet_clear(box->c, &pkt);
+        inner = alloc_block(b, &box->al);
+        pay = caml_alloc(1, block_tag);
+        Store_field(pay, 0, inner);
+    } else if (const_tag >= 0) {
+        chc_async_packet_clear(box->c, &pkt);
+        pay = Val_int(const_tag);
+    } else if (pkt.kind == CHC_PKT_EXCEPTION) {
+        const chc_exception *e = pkt.exception;
+        /* Materialise before clearing — packet_clear frees the exception. */
+        s1 = caml_alloc_initialized_string(e && e->name ? e->name_len : 0, (e && e->name) ? e->name : "");
+        s2 = caml_alloc_initialized_string(e && e->display_text ? e->display_text_len : 0, (e && e->display_text) ? e->display_text : "");
+        s3 = caml_alloc_initialized_string(e && e->stack_trace ? e->stack_trace_len : 0, (e && e->stack_trace) ? e->stack_trace : "");
+        inner = caml_alloc(4, 0);
+        Store_field(inner, 0, Val_long(e ? (long) e->code : 0));
+        Store_field(inner, 1, s1);
+        Store_field(inner, 2, s2);
+        Store_field(inner, 3, s3);
+        chc_async_packet_clear(box->c, &pkt);
+        pay = caml_alloc(1, PKT_TAG_EXCEPTION);
+        Store_field(pay, 0, inner);
+    } else if (pkt.kind == CHC_PKT_PROGRESS) {
+        inner = caml_alloc(5, 0);
+        Store_field(inner, 0, Val_long((long) pkt.progress.rows));
+        Store_field(inner, 1, Val_long((long) pkt.progress.bytes));
+        Store_field(inner, 2, Val_long((long) pkt.progress.total_rows));
+        Store_field(inner, 3, Val_long((long) pkt.progress.written_rows));
+        Store_field(inner, 4, Val_long((long) pkt.progress.written_bytes));
+        chc_async_packet_clear(box->c, &pkt);
+        pay = caml_alloc(1, PKT_TAG_PROGRESS);
+        Store_field(pay, 0, inner);
+    } else if (pkt.kind == CHC_PKT_PROFILE_INFO) {
+        inner = caml_alloc(6, 0);
+        Store_field(inner, 0, Val_long((long) pkt.profile.rows));
+        Store_field(inner, 1, Val_long((long) pkt.profile.blocks));
+        Store_field(inner, 2, Val_long((long) pkt.profile.bytes));
+        Store_field(inner, 3, Val_long((long) pkt.profile.rows_before_limit));
+        Store_field(inner, 4, Val_bool(pkt.profile.applied_limit));
+        Store_field(inner, 5, Val_bool(pkt.profile.calculated_rows_before_limit));
+        chc_async_packet_clear(box->c, &pkt);
+        pay = caml_alloc(1, PKT_TAG_PROFILE_INFO);
+        Store_field(pay, 0, inner);
+    } else {
+        chc_async_packet_clear(box->c, &pkt);
+        caml_invalid_argument("Chc.Async: unknown packet kind from server");
+    }
+
+    res = caml_alloc(1, 0); /* Some */
+    Store_field(res, 0, pay);
+    CAMLreturn(res);
 }

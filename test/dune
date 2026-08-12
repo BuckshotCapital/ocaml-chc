@@ -1,3 +1,6 @@
-(test
- (name test_decode)
+; test_decode is hermetic (drives `clickhouse local`). test_client needs a live
+; server and skips cleanly when CHC_TEST_HOST is unset.
+
+(tests
+ (names test_decode test_client)
  (libraries chc unix))
