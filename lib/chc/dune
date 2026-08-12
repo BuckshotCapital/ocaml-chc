@@ -1,6 +1,16 @@
 (library
  (name chc)
- (libraries unix)
+ ; ipaddr is optional. (select) picks the backend by availability; chc_ip.mli
+ ; keeps both interchangeable, so the public API is `string` either way and the
+ ; dependency never reaches Chc.value. Query which one is live via
+ ; Chc.ip_backend.
+ (libraries
+  unix
+  (select
+   chc_ip.ml
+   from
+   (ipaddr -> chc_ip.ipaddr.ml)
+   (-> chc_ip.fallback.ml)))
  (foreign_stubs
   (language c)
   (names chc_stubs)

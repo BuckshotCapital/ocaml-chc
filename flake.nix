@@ -27,10 +27,17 @@
           packages = [
             pkgs.ocaml
             pkgs.dune_3
+            pkgs.ocamlPackages.findlib
             pkgs.ocamlformat
             pkgs.opam
             pkgs.pkg-config
             pkgs.gmp
+
+            # Optional. dune's (select) compiles the ipaddr-backed IP formatter
+            # when this is present and the hand-rolled one when it is not; both
+            # are held to the same tests. Comment it out to exercise the
+            # fallback, then check Chc.ip_backend.
+            pkgs.ocamlPackages.ipaddr
 
             # clang-format for the C stubs; `make fmt` drives both formatters.
             pkgs.clang-tools

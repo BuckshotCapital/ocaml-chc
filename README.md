@@ -96,7 +96,8 @@ truncated:
 | `IPv4`/`IPv6` | `Ip` | `"192.168.1.1"`, `"2001:db8::1"` |
 
 These match ClickHouse's own rendering byte for byte, which the tests assert by
-comparing every decode against the server's `toString` of the same expression —
+comparing every decode against the server's `toString` of the same expression,
+under both IP backends (see [Optional dependencies](#optional-dependencies)) —
 including `Int128` at its minimum, `UInt256` at its maximum, RFC 5952 `::`
 compression and IPv4-mapped `IPv6`. Decimals print in shortest exact form
 (trailing fractional zeros dropped, then the point), which is what both
@@ -112,6 +113,39 @@ enforces the invariants the server itself enforces (monotonic array offsets,
 in-range `LowCardinality` keys). `chc_block_read` does *not* check these, and a
 forged block can otherwise drive reads past an inner column's bounds. Pass
 `~validate:false` only for trusted input on a hot path.
+
+## Optional dependencies
+
+OCaml has no equivalent of Cargo features — no consumer-side `--features`, and
+no way for a downstream package to request one. What dune offers instead is
+`(select)`, which picks an implementation by whether a library is *available*:
+
+```
+(libraries
+ unix
+ (select chc_ip.ml from
+  (ipaddr -> chc_ip.ipaddr.ml)
+  (-> chc_ip.fallback.ml)))
+```
+
+IPv4/IPv6 conversion goes through that. With
+[`ipaddr`](https://github.com/mirage/ocaml-ipaddr) installed you get its
+implementation; without it, the hand-rolled fallback. `Chc.ip_backend` reports
+which one was compiled in.
+
+The constraint that makes this safe is `chc_ip.mli`: both backends satisfy one
+signature that deals only in `string`, so the choice **cannot reach
+`Chc.value`**. A `(select)` that changed a public type would be worse than no
+abstraction at all — the API would differ by what happened to be installed,
+invisibly, and downstream code would break in ways the signature never hinted
+at. That is the same hazard behind Rust's "features must be additive" rule,
+with sharper teeth here because it surfaces as a type error.
+
+For the same reason the wide-integer and decimal rendering is *not* optional:
+it is used in core decoding, so making it `zarith`-backed would turn a GMP
+dependency into a hard requirement for every user. Those 83 lines of long
+division stay, verified against the server at `Int128` min/max and `UInt256`
+max.
 
 ## Build
 

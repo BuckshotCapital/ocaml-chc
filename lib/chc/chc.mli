@@ -127,6 +127,11 @@ type value =
 
 val string_of_value : value -> string
 
+(** Which IPv4/IPv6 implementation was compiled in: ["ipaddr"] when that library was available at build time, ["builtin"]
+    otherwise. Behaviour is identical either way — both are checked against the server's own rendering — so this is for
+    confirming what a deployment actually got, not for branching on. *)
+val ip_backend : string
+
 (** {1 Blocks} *)
 
 type block

@@ -129,6 +129,8 @@ let () =
   print_endline "low cardinality nullable";
   let _, _, d = read_all "SELECT toLowCardinality(if(number = 1, NULL, 'v')) AS lc FROM numbers(3)" in
   check_eq "lc nullable" ~expected:"v,NULL,v" ~actual:(String.concat "," (Array.to_list (Array.map show (col_all d 0))));
+  Printf.printf "ip backend: %s\n" Chc.ip_backend;
+  check "ip backend is one of the two" (Chc.ip_backend = "ipaddr" || Chc.ip_backend = "builtin");
   print_endline "wide types render as ClickHouse does";
   (* clickhouse-local renders the same canonical text the server does, so the
      second column is the oracle for the first. *)

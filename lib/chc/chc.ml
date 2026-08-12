@@ -348,49 +348,9 @@ let uuid_to_string le =
       (Int64.logand lo 0xFFFFFFFFFFFFL))
 ;;
 
-let ipv4_to_string u =
-  let b k = Int64.to_int (Int64.logand (Int64.shift_right_logical u k) 0xFFL) in
-  Printf.sprintf "%d.%d.%d.%d" (b 24) (b 16) (b 8) (b 0)
-;;
-
 (* RFC 5952: lowercase, no leading zeros, longest run of zero groups collapsed
    to "::", and IPv4-mapped addresses rendered in dotted-quad tail form — which
    is what ClickHouse's own toString does. *)
-let ipv6_to_string be =
-  if String.length be <> 16
-  then "0x" ^ hex be
-  else (
-    let group i = (Char.code be.[2 * i] lsl 8) lor Char.code be.[(2 * i) + 1] in
-    let g = Array.init 8 group in
-    let mapped = g.(0) = 0 && g.(1) = 0 && g.(2) = 0 && g.(3) = 0 && g.(4) = 0 && g.(5) = 0xffff in
-    if mapped
-    then Printf.sprintf "::ffff:%d.%d.%d.%d" (Char.code be.[12]) (Char.code be.[13]) (Char.code be.[14]) (Char.code be.[15])
-    else (
-      let best_at = ref (-1)
-      and best_len = ref 0
-      and at = ref (-1)
-      and len = ref 0 in
-      for i = 0 to 7 do
-        if g.(i) = 0
-        then (
-          if !at < 0 then at := i;
-          incr len;
-          if !len > !best_len
-          then (
-            best_len := !len;
-            best_at := !at))
-        else (
-          at := -1;
-          len := 0)
-      done;
-      if !best_len < 2 then best_at := -1;
-      let hexes = Array.to_list (Array.map (Printf.sprintf "%x") g) in
-      if !best_at < 0
-      then String.concat ":" hexes
-      else (
-        let take from len = List.filteri (fun i _ -> i >= from && i < from + len) hexes in
-        String.concat ":" (take 0 !best_at) ^ "::" ^ String.concat ":" (take (!best_at + !best_len) (8 - !best_at - !best_len)))))
-;;
 
 (* --- text back to wire bytes, for the write path --- *)
 
@@ -458,71 +418,15 @@ let uuid_of_string s =
   Bytes.unsafe_to_string b
 ;;
 
-let ipv4_of_string s =
-  match String.split_on_char '.' s with
-  | [ a; b; c; d ] ->
-    let p x =
-      let v = int_of_string x in
-      if v < 0 || v > 255 then invalid_arg (Printf.sprintf "Chc: %S is not an IPv4 address" s);
-      Int64.of_int v
-    in
-    Int64.logor (Int64.shift_left (p a) 24) (Int64.logor (Int64.shift_left (p b) 16) (Int64.logor (Int64.shift_left (p c) 8) (p d)))
-  | _ -> invalid_arg (Printf.sprintf "Chc: %S is not an IPv4 address" s)
-;;
-
 (* Accepts the forms ClickHouse emits: full groups, a single "::" run, and a
    dotted-quad tail for IPv4-mapped addresses. *)
-let ipv6_of_string s =
-  let bad () = invalid_arg (Printf.sprintf "Chc: %S is not an IPv6 address" s) in
-  let expand part =
-    if part = ""
-    then []
-    else (
-      let chunks = String.split_on_char ':' part in
-      List.concat_map
-        (fun c ->
-           if String.contains c '.'
-           then (
-             let v = ipv4_of_string c in
-             let hi = Int64.to_int (Int64.shift_right_logical v 16) land 0xffff in
-             let lo = Int64.to_int v land 0xffff in
-             [ hi; lo ])
-           else if c = ""
-           then bad ()
-           else (
-             let v = int_of_string ("0x" ^ c) in
-             if v < 0 || v > 0xffff then bad ();
-             [ v ]))
-        chunks)
-  in
-  let groups =
-    match
-      (* split on the single "::" run, if any *)
-      let rec find i = if i + 1 >= String.length s then None else if s.[i] = ':' && s.[i + 1] = ':' then Some i else find (i + 1) in
-      find 0
-    with
-    | None ->
-      let g = expand s in
-      if List.length g <> 8 then bad ();
-      g
-    | Some i ->
-      let left = expand (String.sub s 0 i) in
-      let right = expand (String.sub s (i + 2) (String.length s - i - 2)) in
-      let fill = 8 - List.length left - List.length right in
-      if fill < 0 then bad ();
-      left @ List.init fill (fun _ -> 0) @ right
-  in
-  let b = Bytes.create 16 in
-  List.iteri
-    (fun i g ->
-       Bytes.set b (2 * i) (Char.unsafe_chr ((g lsr 8) land 0xff));
-       Bytes.set b ((2 * i) + 1) (Char.unsafe_chr (g land 0xff)))
-    groups;
-  Bytes.unsafe_to_string b
-;;
 
 (* BFloat16 is the top half of a Float32. *)
 let bfloat16_to_float u16 = Int32.float_of_bits (Int32.shift_left (Int32.of_int u16) 16)
+
+(* Which IP implementation dune selected: "ipaddr" or "builtin". Behaviour is
+   identical either way — this exists so a deployment can confirm what it got. *)
+let ip_backend = Chc_ip.backend
 
 let rec string_of_value = function
   | Null -> "NULL"
@@ -623,8 +527,8 @@ let decode_fixed (kind : Kind.t) ~scale (data : string) (elem : int) (n : int) :
   | Kind.Decimal32 | Kind.Decimal64 | Kind.Decimal128 | Kind.Decimal256 ->
     Array.init n (fun i -> Decimal (decimal_to_string ~scale (slice i)))
   | Kind.UUID -> Array.init n (fun i -> Uuid (uuid_to_string (slice i)))
-  | Kind.IPv4 -> Array.init n (fun i -> Ip (ipv4_to_string (u32 i)))
-  | Kind.IPv6 -> Array.init n (fun i -> Ip (ipv6_to_string (slice i)))
+  | Kind.IPv4 -> Array.init n (fun i -> Ip (Chc_ip.v4_to_string (u32 i)))
+  | Kind.IPv6 -> Array.init n (fun i -> if elem = 16 then Ip (Chc_ip.v6_to_string (slice i)) else Raw (slice i))
   (* Anything still unmodelled keeps its wire bytes rather than being guessed at. *)
   | _ -> Array.init n (fun i -> Raw (slice i))
 ;;
@@ -1003,14 +907,14 @@ module Async = struct
       | Kind.IPv4 ->
         Some
           (function
-            | Ip a -> Uint (ipv4_of_string a)
-            | Str a -> Uint (ipv4_of_string a)
+            | Ip a -> Uint (Chc_ip.v4_of_string a)
+            | Str a -> Uint (Chc_ip.v4_of_string a)
             | v -> v)
       | Kind.IPv6 ->
         Some
           (function
-            | Ip a -> Raw (ipv6_of_string a)
-            | Str a -> Raw (ipv6_of_string a)
+            | Ip a -> Raw (Chc_ip.v6_of_string a)
+            | Str a -> Raw (Chc_ip.v6_of_string a)
             | v -> v)
       | Kind.Int128 | Kind.Int256 | Kind.UInt128 | Kind.UInt256 ->
         Some
