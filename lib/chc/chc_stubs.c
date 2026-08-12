@@ -505,6 +505,29 @@ CAMLprim value chc_stub_col_lc_dict(value vb, value vc) {
     CAMLreturn(caml_copy_nativeint((intnat) (uintptr_t) d));
 }
 
+/* Parse a printable ClickHouse type on its own, outside any block, and report
+ * (kind, elem_size, decimal_scale). The writer needs a column's width and scale
+ * to turn Big/Decimal/Uuid/Ip text into wire bytes, and this reuses the C type
+ * parser instead of re-implementing type-name parsing in OCaml. */
+CAMLprim value chc_stub_type_info(value vname) {
+    CAMLparam1(vname);
+    CAMLlocal1(tup);
+
+    chc_alloc al = chc_alloc_stdlib();
+    chc_type *t = NULL;
+    chc_err err = {0};
+    if (chc_type_parse(String_val(vname), caml_string_length(vname), &al, &t, &err) != CHC_OK) {
+        chc_raise_error(CHC_ERR_TYPE, &err);
+    }
+
+    tup = caml_alloc(3, 0);
+    Store_field(tup, 0, Val_long((long) chc_type_kind(t)));
+    Store_field(tup, 1, Val_long((long) chc_type_elem_size(t)));
+    Store_field(tup, 2, Val_long((long) chc_type_decimal_scale(t)));
+    chc_type_destroy(t, &al);
+    CAMLreturn(tup);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Async client                                                               */
 /* -------------------------------------------------------------------------- */
@@ -866,8 +889,12 @@ enum {
     VAL_FLOAT = 3,
     VAL_STR = 4,
     VAL_RAW = 5,
-    VAL_ARR = 6,
-    VAL_TUP = 7,
+    VAL_BIG = 6,
+    VAL_DECIMAL = 7,
+    VAL_UUID = 8,
+    VAL_IP = 9,
+    VAL_ARR = 10,
+    VAL_TUP = 11,
 };
 
 /* Per-column scratch. Every buffer here is referenced by the chc_column tree

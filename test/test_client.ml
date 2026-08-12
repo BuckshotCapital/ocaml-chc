@@ -72,6 +72,31 @@ let run host =
   check_eq "map" ~expected:"[(a, 1), (b, 2)]" ~actual:(one_value c "SELECT map('a', 1, 'b', 2)");
   check_eq "lowcardinality" ~expected:"z" ~actual:(one_value c "SELECT toLowCardinality('z')");
   check_eq "nested nullable array" ~expected:"[[a, NULL], [b]]" ~actual:(one_value c "SELECT [['a', NULL], ['b']]");
+  print_endline "wide types agree with the server's own toString";
+  let agrees expr =
+    let _, r = Chc.Client.query_rows c (Printf.sprintf "SELECT %s AS v, toString(%s) AS s" expr expr) in
+    check_eq ("toString " ^ expr) ~expected:(show r.(0).(1)) ~actual:(show r.(0).(0))
+  in
+  agrees "toUUID('61f0c404-5cb3-11e7-907b-a6006ad3dba0')";
+  agrees "toUUID('00000000-0000-0000-0000-000000000000')";
+  agrees "toIPv4('192.168.1.1')";
+  agrees "toIPv4('0.0.0.0')";
+  agrees "toIPv4('255.255.255.255')";
+  agrees "toIPv6('2001:db8::1')";
+  agrees "toIPv6('::1')";
+  agrees "toIPv6('::ffff:192.168.1.1')";
+  agrees "toIPv6('fe80::1ff:fe23:4567:890a')";
+  agrees "toInt128('-170141183460469231731687303715884105728')";
+  agrees "toInt128('170141183460469231731687303715884105727')";
+  agrees "toUInt128('340282366920938463463374607431768211455')";
+  agrees "toInt256('-57896044618658097711785492504343953926634992332820282019728792003956564819968')";
+  agrees "toUInt256('115792089237316195423570985008687907853269984665640564039457584007913129639935')";
+  agrees "toDecimal32(-1.5, 2)";
+  agrees "toDecimal64('1.2345', 4)";
+  agrees "toDecimal128('-9.87654321', 8)";
+  agrees "toDecimal256('123456789.000000000000001', 15)";
+  agrees "toInt128(0)";
+  agrees "toDecimal64(0, 4)";
   print_endline "column metadata";
   let names, _ = Chc.Client.query_rows c "SELECT 1 AS a, 'x' AS b" in
   check_eq "column names" ~expected:"a,b" ~actual:(String.concat "," (Array.to_list names));
@@ -148,6 +173,60 @@ let run host =
   Chc.Client.insert c tbl ~columns:[ "id"; "name" ] [| [| Chc.Uint 7L; Chc.Str "seven" |] |];
   check_eq "subset insert" ~expected:"seven" ~actual:(one_value c (Printf.sprintf "SELECT name FROM %s WHERE id = 7" tbl));
   check_eq "unlisted column defaulted" ~expected:"0." ~actual:(one_value c (Printf.sprintf "SELECT score FROM %s WHERE id = 7" tbl));
+  print_endline "wide types round-trip through INSERT";
+  let wtbl = tbl ^ "_wide" in
+  Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s" wtbl);
+  Chc.Client.execute
+    c
+    (Printf.sprintf
+       "CREATE TABLE %s (u UUID, v4 IPv4, v6 IPv6, big Int128, ubig UInt256, dec Decimal64(4), ndec Nullable(Decimal128(8))) ENGINE = \
+        Memory"
+       wtbl);
+  let wide_rows =
+    [| [| Chc.Uuid "61f0c404-5cb3-11e7-907b-a6006ad3dba0"
+        ; Chc.Ip "192.168.1.1"
+        ; Chc.Ip "2001:db8::1"
+        ; Chc.Big "-170141183460469231731687303715884105728"
+        ; Chc.Big "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        ; Chc.Decimal "1.2345"
+        ; Chc.Decimal "-9.87654321"
+       |]
+     ; [| Chc.Uuid "00000000-0000-0000-0000-000000000000"
+        ; Chc.Ip "0.0.0.0"
+        ; Chc.Ip "::ffff:192.168.1.1"
+        ; Chc.Big "0"
+        ; Chc.Big "0"
+        ; Chc.Decimal "-0.0001"
+        ; Chc.Null
+       |]
+    |]
+  in
+  Chc.Client.insert c wtbl wide_rows;
+  let _, back = Chc.Client.query_rows c (Printf.sprintf "SELECT * FROM %s ORDER BY u DESC" wtbl) in
+  check_eq "rows back" ~expected:"2" ~actual:(string_of_int (Array.length back));
+  let cell r c = show back.(r).(c) in
+  check_eq "uuid round-trip" ~expected:"61f0c404-5cb3-11e7-907b-a6006ad3dba0" ~actual:(cell 0 0);
+  check_eq "ipv4 round-trip" ~expected:"192.168.1.1" ~actual:(cell 0 1);
+  check_eq "ipv6 round-trip" ~expected:"2001:db8::1" ~actual:(cell 0 2);
+  check_eq "int128 min round-trip" ~expected:"-170141183460469231731687303715884105728" ~actual:(cell 0 3);
+  check_eq
+    "uint256 max round-trip"
+    ~expected:"115792089237316195423570985008687907853269984665640564039457584007913129639935"
+    ~actual:(cell 0 4);
+  check_eq "decimal round-trip" ~expected:"1.2345" ~actual:(cell 0 5);
+  check_eq "wide decimal round-trip" ~expected:"-9.87654321" ~actual:(cell 0 6);
+  check_eq "ipv4-mapped round-trip" ~expected:"::ffff:192.168.1.1" ~actual:(cell 1 2);
+  check_eq "negative decimal round-trip" ~expected:"-0.0001" ~actual:(cell 1 5);
+  check_eq "nullable wide null" ~expected:"NULL" ~actual:(cell 1 6);
+  check_eq
+    "server agrees the uuid is what we meant"
+    ~expected:"1"
+    ~actual:(one_value c (Printf.sprintf "SELECT count() FROM %s WHERE u = toUUID('61f0c404-5cb3-11e7-907b-a6006ad3dba0')" wtbl));
+  check_eq
+    "server agrees the ipv6 is what we meant"
+    ~expected:"1"
+    ~actual:(one_value c (Printf.sprintf "SELECT count() FROM %s WHERE v6 = toIPv6('2001:db8::1')" wtbl));
+  Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s" wtbl);
   print_endline "unsupported write type is refused, not mis-encoded";
   Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s_arr" tbl);
   Chc.Client.execute c (Printf.sprintf "CREATE TABLE %s_arr (a Array(UInt8)) ENGINE = Memory" tbl);

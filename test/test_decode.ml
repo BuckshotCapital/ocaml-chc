@@ -129,13 +129,33 @@ let () =
   print_endline "low cardinality nullable";
   let _, _, d = read_all "SELECT toLowCardinality(if(number = 1, NULL, 'v')) AS lc FROM numbers(3)" in
   check_eq "lc nullable" ~expected:"v,NULL,v" ~actual:(String.concat "," (Array.to_list (Array.map show (col_all d 0))));
-  print_endline "wide fixed types surface as raw bytes";
-  let _, types, d = read_all "SELECT toUUID('00000000-0000-0000-0000-000000000001') AS u" in
-  check_eq "uuid type" ~expected:"UUID" ~actual:types.(0);
+  print_endline "wide types render as ClickHouse does";
+  (* clickhouse-local renders the same canonical text the server does, so the
+     second column is the oracle for the first. *)
+  let agrees expr =
+    let _, _, d = read_all (Printf.sprintf "SELECT %s AS v, toString(%s) AS s" expr expr) in
+    check_eq ("toString " ^ expr) ~expected:(show (col_all d 1).(0)) ~actual:(show (col_all d 0).(0))
+  in
+  agrees "toUUID('61f0c404-5cb3-11e7-907b-a6006ad3dba0')";
+  agrees "toIPv4('192.168.1.1')";
+  agrees "toIPv6('2001:db8::1')";
+  agrees "toIPv6('::ffff:192.168.1.1')";
+  agrees "toInt128('-170141183460469231731687303715884105728')";
+  agrees "toUInt256('115792089237316195423570985008687907853269984665640564039457584007913129639935')";
+  agrees "toDecimal64('1.2345', 4)";
+  agrees "toDecimal32(-1.5, 2)";
+  agrees "toDecimal128('-9.87654321', 8)";
+  let _, _, d = read_all "SELECT toUUID('61f0c404-5cb3-11e7-907b-a6006ad3dba0')" in
   check
-    ("uuid is 16 raw bytes: " ^ show (col_all d 0).(0))
+    "uuid uses the Uuid constructor"
     (match (col_all d 0).(0) with
-     | Chc.Raw s -> String.length s = 16
+     | Chc.Uuid _ -> true
+     | _ -> false);
+  let _, _, d = read_all "SELECT toDecimal64('1.2345', 4)" in
+  check
+    "decimal uses the Decimal constructor"
+    (match (col_all d 0).(0) with
+     | Chc.Decimal _ -> true
      | _ -> false);
   print_endline "larger stream";
   let _, _, d = read_all "SELECT number AS n FROM numbers(100000)" in

@@ -102,17 +102,26 @@ end
 
 (** A decoded cell.
 
-    Types with no faithful OCaml counterpart yet — 128/256-bit integers and decimals, [UUID], [IPv6], [BFloat16] — surface as {!Raw} holding
-    their little-endian wire bytes rather than being lossily coerced. [Map] decodes as {!Arr} of two-element {!Tup}, matching its physical
-    layout. *)
+    Wide fixed-width types that exceed OCaml's integer types are rendered to exact text rather than truncated: {!Big} for
+    [Int128]/[Int256]/[UInt128]/[UInt256], {!Decimal} for the [Decimal*] family with the type's scale already applied.
+    {!Uuid} and {!Ip} carry canonical text matching ClickHouse's own [toString], for [UUID] and for [IPv4]/[IPv6]
+    respectively.
+
+    {!Raw} is the fallback for anything still unmodelled, holding little-endian wire bytes rather than a guess.
+
+    [Map] decodes as {!Arr} of two-element {!Tup}, matching its physical layout. *)
 type value =
   | Null
   | Bool of bool
-  | Int of int64 (** signed integers, and scaled decimal/time mantissas *)
+  | Int of int64 (** signed integers, and scaled time mantissas *)
   | Uint of int64 (** unsigned; reinterpret via [Int64.unsigned_*] *)
   | Float of float
   | Str of string
   | Raw of string (** fixed-width bytes, little-endian *)
+  | Big of string (** exact decimal text for 128/256-bit integers *)
+  | Decimal of string (** exact decimal text, scale applied *)
+  | Uuid of string (** canonical 8-4-4-4-12 *)
+  | Ip of string (** dotted quad, or RFC 5952 for IPv6 *)
   | Arr of value array
   | Tup of value array
 

@@ -239,10 +239,290 @@ type value =
   | Float of float
   | Str of string
   | Raw of string
+  | Big of string
+  | Decimal of string
+  | Uuid of string
+  | Ip of string
   | Arr of value array
   | Tup of value array
 
 let hex s = String.concat "" (List.map (Printf.sprintf "%02x") (List.of_seq (Seq.map Char.code (String.to_seq s))))
+
+(* -------------------------------------------------------------------------- *)
+(* Wide fixed-width types                                                     *)
+(* -------------------------------------------------------------------------- *)
+
+(* Int128/256 and Decimal128/256 exceed every OCaml integer type, so they are
+   rendered to exact decimal text rather than truncated. Long division by 10
+   over the base-256 digits: 32 bytes is at most 78 iterations, which is
+   nothing next to the I/O that produced the value. *)
+let bignum_to_string ~signed (le : string) =
+  let n = String.length le in
+  if n = 0
+  then "0"
+  else (
+    let b = Bytes.create n in
+    (* to big-endian, which is the natural order for long division *)
+    for i = 0 to n - 1 do
+      Bytes.set b i le.[n - 1 - i]
+    done;
+    let negative = signed && Char.code (Bytes.get b 0) land 0x80 <> 0 in
+    if negative
+    then (
+      for i = 0 to n - 1 do
+        Bytes.set b i (Char.unsafe_chr (lnot (Char.code (Bytes.get b i)) land 0xff))
+      done;
+      let rec carry i =
+        if i >= 0
+        then (
+          let v = Char.code (Bytes.get b i) + 1 in
+          Bytes.set b i (Char.unsafe_chr (v land 0xff));
+          if v > 0xff then carry (i - 1))
+      in
+      carry (n - 1));
+    let digits = Buffer.create 48 in
+    let rec divide () =
+      let rem = ref 0 in
+      let quotient_nonzero = ref false in
+      for i = 0 to n - 1 do
+        let cur = (!rem lsl 8) lor Char.code (Bytes.get b i) in
+        let q = cur / 10 in
+        rem := cur mod 10;
+        Bytes.set b i (Char.unsafe_chr q);
+        if q <> 0 then quotient_nonzero := true
+      done;
+      Buffer.add_char digits (Char.unsafe_chr (Char.code '0' + !rem));
+      if !quotient_nonzero then divide ()
+    in
+    divide ();
+    let d = Buffer.contents digits in
+    let len = String.length d in
+    let out = Bytes.create (len + if negative then 1 else 0) in
+    if negative then Bytes.set out 0 '-';
+    let off = if negative then 1 else 0 in
+    for i = 0 to len - 1 do
+      Bytes.set out (off + i) d.[len - 1 - i]
+    done;
+    Bytes.unsafe_to_string out)
+;;
+
+(* Decimals are a scaled integer mantissa; the scale lives in the type, not the
+   value, so it has to be threaded in from the column. *)
+let decimal_to_string ~scale le =
+  let d = bignum_to_string ~signed:true le in
+  if scale <= 0
+  then d
+  else (
+    let negative = String.length d > 0 && d.[0] = '-' in
+    let digits = if negative then String.sub d 1 (String.length d - 1) else d in
+    let digits = if String.length digits <= scale then String.make (scale + 1 - String.length digits) '0' ^ digits else digits in
+    let cut = String.length digits - scale in
+    let int_part = String.sub digits 0 cut in
+    (* ClickHouse renders a decimal in its shortest exact form — trailing zeros
+       in the fraction go, and the point goes with them if nothing is left.
+       Verified against toString and against TSV column output, which agree. *)
+    let frac = String.sub digits cut scale in
+    let last = ref (String.length frac) in
+    while !last > 0 && frac.[!last - 1] = '0' do
+      decr last
+    done;
+    let frac = String.sub frac 0 !last in
+    let body = if frac = "" then int_part else int_part ^ "." ^ frac in
+    if negative && body <> "0" then "-" ^ body else body)
+;;
+
+(* ClickHouse stores a UUID as two UInt64s, each little-endian on the wire:
+   bytes 0..7 are the high half, 8..15 the low half. *)
+let uuid_to_string le =
+  if String.length le <> 16
+  then "0x" ^ hex le
+  else (
+    let hi = String.get_int64_le le 0
+    and lo = String.get_int64_le le 8 in
+    Printf.sprintf
+      "%08Lx-%04Lx-%04Lx-%04Lx-%012Lx"
+      (Int64.shift_right_logical hi 32)
+      (Int64.logand (Int64.shift_right_logical hi 16) 0xFFFFL)
+      (Int64.logand hi 0xFFFFL)
+      (Int64.shift_right_logical lo 48)
+      (Int64.logand lo 0xFFFFFFFFFFFFL))
+;;
+
+let ipv4_to_string u =
+  let b k = Int64.to_int (Int64.logand (Int64.shift_right_logical u k) 0xFFL) in
+  Printf.sprintf "%d.%d.%d.%d" (b 24) (b 16) (b 8) (b 0)
+;;
+
+(* RFC 5952: lowercase, no leading zeros, longest run of zero groups collapsed
+   to "::", and IPv4-mapped addresses rendered in dotted-quad tail form — which
+   is what ClickHouse's own toString does. *)
+let ipv6_to_string be =
+  if String.length be <> 16
+  then "0x" ^ hex be
+  else (
+    let group i = (Char.code be.[2 * i] lsl 8) lor Char.code be.[(2 * i) + 1] in
+    let g = Array.init 8 group in
+    let mapped = g.(0) = 0 && g.(1) = 0 && g.(2) = 0 && g.(3) = 0 && g.(4) = 0 && g.(5) = 0xffff in
+    if mapped
+    then Printf.sprintf "::ffff:%d.%d.%d.%d" (Char.code be.[12]) (Char.code be.[13]) (Char.code be.[14]) (Char.code be.[15])
+    else (
+      let best_at = ref (-1)
+      and best_len = ref 0
+      and at = ref (-1)
+      and len = ref 0 in
+      for i = 0 to 7 do
+        if g.(i) = 0
+        then (
+          if !at < 0 then at := i;
+          incr len;
+          if !len > !best_len
+          then (
+            best_len := !len;
+            best_at := !at))
+        else (
+          at := -1;
+          len := 0)
+      done;
+      if !best_len < 2 then best_at := -1;
+      let hexes = Array.to_list (Array.map (Printf.sprintf "%x") g) in
+      if !best_at < 0
+      then String.concat ":" hexes
+      else (
+        let take from len = List.filteri (fun i _ -> i >= from && i < from + len) hexes in
+        String.concat ":" (take 0 !best_at) ^ "::" ^ String.concat ":" (take (!best_at + !best_len) (8 - !best_at - !best_len)))))
+;;
+
+(* --- text back to wire bytes, for the write path --- *)
+
+(* Parse a decimal integer into [width] little-endian bytes, two's complement.
+   Overflow is an error rather than a silent wrap: a column that cannot hold the
+   value should say so. *)
+let bignum_of_string ~width (s : string) =
+  let negative = String.length s > 0 && s.[0] = '-' in
+  let start = if negative || (String.length s > 0 && s.[0] = '+') then 1 else 0 in
+  let b = Bytes.make width '\000' in
+  for i = start to String.length s - 1 do
+    let c = s.[i] in
+    if c < '0' || c > '9' then invalid_arg (Printf.sprintf "Chc: %S is not an integer" s);
+    let carry = ref (Char.code c - Char.code '0') in
+    for k = width - 1 downto 0 do
+      let v = (Char.code (Bytes.get b k) * 10) + !carry in
+      Bytes.set b k (Char.unsafe_chr (v land 0xff));
+      carry := v lsr 8
+    done;
+    if !carry <> 0 then invalid_arg (Printf.sprintf "Chc: %S overflows a %d-byte column" s width)
+  done;
+  if negative
+  then (
+    for i = 0 to width - 1 do
+      Bytes.set b i (Char.unsafe_chr (lnot (Char.code (Bytes.get b i)) land 0xff))
+    done;
+    let rec carry i =
+      if i >= 0
+      then (
+        let v = Char.code (Bytes.get b i) + 1 in
+        Bytes.set b i (Char.unsafe_chr (v land 0xff));
+        if v > 0xff then carry (i - 1))
+    in
+    carry (width - 1));
+  let le = Bytes.create width in
+  for i = 0 to width - 1 do
+    Bytes.set le i (Bytes.get b (width - 1 - i))
+  done;
+  Bytes.unsafe_to_string le
+;;
+
+(* Drop the point and pad or truncate the fraction to the column's scale, which
+   turns the text back into the integer mantissa the wire carries. *)
+let mantissa_of_decimal ~scale s =
+  let negative = String.length s > 0 && s.[0] = '-' in
+  let body = if negative || (String.length s > 0 && s.[0] = '+') then String.sub s 1 (String.length s - 1) else s in
+  let int_part, frac_part =
+    match String.index_opt body '.' with
+    | None -> body, ""
+    | Some i -> String.sub body 0 i, String.sub body (i + 1) (String.length body - i - 1)
+  in
+  let int_part = if int_part = "" then "0" else int_part in
+  let frac =
+    if String.length frac_part >= scale then String.sub frac_part 0 scale else frac_part ^ String.make (scale - String.length frac_part) '0'
+  in
+  (if negative then "-" else "") ^ int_part ^ frac
+;;
+
+let uuid_of_string s =
+  let h = String.concat "" (String.split_on_char '-' s) in
+  if String.length h <> 32 then invalid_arg (Printf.sprintf "Chc: %S is not a UUID" s);
+  let b = Bytes.create 16 in
+  Bytes.set_int64_le b 0 (Int64.of_string ("0x" ^ String.sub h 0 16));
+  Bytes.set_int64_le b 8 (Int64.of_string ("0x" ^ String.sub h 16 16));
+  Bytes.unsafe_to_string b
+;;
+
+let ipv4_of_string s =
+  match String.split_on_char '.' s with
+  | [ a; b; c; d ] ->
+    let p x =
+      let v = int_of_string x in
+      if v < 0 || v > 255 then invalid_arg (Printf.sprintf "Chc: %S is not an IPv4 address" s);
+      Int64.of_int v
+    in
+    Int64.logor (Int64.shift_left (p a) 24) (Int64.logor (Int64.shift_left (p b) 16) (Int64.logor (Int64.shift_left (p c) 8) (p d)))
+  | _ -> invalid_arg (Printf.sprintf "Chc: %S is not an IPv4 address" s)
+;;
+
+(* Accepts the forms ClickHouse emits: full groups, a single "::" run, and a
+   dotted-quad tail for IPv4-mapped addresses. *)
+let ipv6_of_string s =
+  let bad () = invalid_arg (Printf.sprintf "Chc: %S is not an IPv6 address" s) in
+  let expand part =
+    if part = ""
+    then []
+    else (
+      let chunks = String.split_on_char ':' part in
+      List.concat_map
+        (fun c ->
+           if String.contains c '.'
+           then (
+             let v = ipv4_of_string c in
+             let hi = Int64.to_int (Int64.shift_right_logical v 16) land 0xffff in
+             let lo = Int64.to_int v land 0xffff in
+             [ hi; lo ])
+           else if c = ""
+           then bad ()
+           else (
+             let v = int_of_string ("0x" ^ c) in
+             if v < 0 || v > 0xffff then bad ();
+             [ v ]))
+        chunks)
+  in
+  let groups =
+    match
+      (* split on the single "::" run, if any *)
+      let rec find i = if i + 1 >= String.length s then None else if s.[i] = ':' && s.[i + 1] = ':' then Some i else find (i + 1) in
+      find 0
+    with
+    | None ->
+      let g = expand s in
+      if List.length g <> 8 then bad ();
+      g
+    | Some i ->
+      let left = expand (String.sub s 0 i) in
+      let right = expand (String.sub s (i + 2) (String.length s - i - 2)) in
+      let fill = 8 - List.length left - List.length right in
+      if fill < 0 then bad ();
+      left @ List.init fill (fun _ -> 0) @ right
+  in
+  let b = Bytes.create 16 in
+  List.iteri
+    (fun i g ->
+       Bytes.set b (2 * i) (Char.unsafe_chr ((g lsr 8) land 0xff));
+       Bytes.set b ((2 * i) + 1) (Char.unsafe_chr (g land 0xff)))
+    groups;
+  Bytes.unsafe_to_string b
+;;
+
+(* BFloat16 is the top half of a Float32. *)
+let bfloat16_to_float u16 = Int32.float_of_bits (Int32.shift_left (Int32.of_int u16) 16)
 
 let rec string_of_value = function
   | Null -> "NULL"
@@ -252,6 +532,10 @@ let rec string_of_value = function
   | Float f -> string_of_float f
   | Str s -> s
   | Raw s -> "0x" ^ hex s
+  | Big s -> s
+  | Decimal s -> s
+  | Uuid s -> s
+  | Ip s -> s
   | Arr a -> "[" ^ String.concat ", " (Array.to_list (Array.map string_of_value a)) ^ "]"
   | Tup a -> "(" ^ String.concat ", " (Array.to_list (Array.map string_of_value a)) ^ ")"
 ;;
@@ -279,6 +563,8 @@ external blk_type_ptr : block_handle -> int -> nativeint = "chc_stub_block_type_
 external ty_kind : block_handle -> nativeint -> int = "chc_stub_type_kind"
 external ty_child : block_handle -> nativeint -> int -> nativeint = "chc_stub_type_child"
 external ty_format : block_handle -> nativeint -> string = "chc_stub_type_format"
+external ty_decimal_scale : block_handle -> nativeint -> int = "chc_stub_type_decimal_scale"
+external type_info_raw : string -> int * int * int = "chc_stub_type_info"
 external col_layout : block_handle -> nativeint -> int = "chc_stub_col_layout"
 external col_n_rows : block_handle -> nativeint -> int = "chc_stub_col_n_rows"
 external col_validate : block_handle -> nativeint -> unit = "chc_stub_col_validate"
@@ -299,7 +585,9 @@ external col_lc_dict : block_handle -> nativeint -> nativeint = "chc_stub_col_lc
 
 let u32_mask = 0xFFFFFFFFL
 
-let decode_fixed (kind : Kind.t) (data : string) (elem : int) (n : int) : value array =
+(* [scale] comes from the column's type rather than the value, so decimals need
+   it passed in; it is ignored for every other kind. *)
+let decode_fixed (kind : Kind.t) ~scale (data : string) (elem : int) (n : int) : value array =
   let off i = i * elem in
   let slice i = String.sub data (off i) elem in
   let i64 i = String.get_int64_le data (off i) in
@@ -317,6 +605,7 @@ let decode_fixed (kind : Kind.t) (data : string) (elem : int) (n : int) : value 
   | Kind.Bool -> Array.init n (fun i -> Bool (String.get_uint8 data (off i) <> 0))
   | Kind.Float32 -> Array.init n (fun i -> Float (Int32.float_of_bits (String.get_int32_le data (off i))))
   | Kind.Float64 -> Array.init n (fun i -> Float (Int64.float_of_bits (i64 i)))
+  | Kind.BFloat16 -> Array.init n (fun i -> Float (bfloat16_to_float (String.get_uint16_le data (off i))))
   (* Days since 1970-01-01, then seconds, then scaled counts. Left as raw
      integers: calendar conversion is a caller policy, not a wire concern. *)
   | Kind.Date -> Array.init n (fun i -> Uint (Int64.of_int (String.get_uint16_le data (off i))))
@@ -327,12 +616,16 @@ let decode_fixed (kind : Kind.t) (data : string) (elem : int) (n : int) : value 
   | Kind.Time64 -> Array.init n (fun i -> Int (i64 i))
   | Kind.Enum8 -> Array.init n (fun i -> Int (Int64.of_int (String.get_int8 data (off i))))
   | Kind.Enum16 -> Array.init n (fun i -> Int (Int64.of_int (String.get_int16_le data (off i))))
-  | Kind.IPv4 -> Array.init n (fun i -> Uint (u32 i))
-  | Kind.Decimal32 -> Array.init n (fun i -> Int (i32 i))
-  | Kind.Decimal64 -> Array.init n (fun i -> Int (i64 i))
   | Kind.FixedString -> Array.init n (fun i -> Str (slice i))
-  (* 128/256-bit integers and decimals, UUID, IPv6, BFloat16: no lossless OCaml
-     representation, so hand back the wire bytes. *)
+  (* Wider than any OCaml integer: rendered to exact decimal text. *)
+  | Kind.Int128 | Kind.Int256 -> Array.init n (fun i -> Big (bignum_to_string ~signed:true (slice i)))
+  | Kind.UInt128 | Kind.UInt256 -> Array.init n (fun i -> Big (bignum_to_string ~signed:false (slice i)))
+  | Kind.Decimal32 | Kind.Decimal64 | Kind.Decimal128 | Kind.Decimal256 ->
+    Array.init n (fun i -> Decimal (decimal_to_string ~scale (slice i)))
+  | Kind.UUID -> Array.init n (fun i -> Uuid (uuid_to_string (slice i)))
+  | Kind.IPv4 -> Array.init n (fun i -> Ip (ipv4_to_string (u32 i)))
+  | Kind.IPv6 -> Array.init n (fun i -> Ip (ipv6_to_string (slice i)))
+  (* Anything still unmodelled keeps its wire bytes rather than being guessed at. *)
   | _ -> Array.init n (fun i -> Raw (slice i))
 ;;
 
@@ -389,7 +682,12 @@ let rec decode_col blk ty col : value array =
   | Layout.Nothing -> Array.make n Null
   | Layout.Fixed ->
     let data, elem = col_fixed blk col in
-    decode_fixed (kind_of blk ty) data elem n
+    let scale =
+      match ty with
+      | Tnode t -> ty_decimal_scale blk t
+      | Tanon _ -> 0
+    in
+    decode_fixed (kind_of blk ty) ~scale data elem n
   | Layout.String -> Array.map (fun s -> Str s) (col_strings blk col)
   | Layout.Nullable ->
     let nulls = col_null_map blk col in
@@ -681,8 +979,63 @@ module Async = struct
     | n -> invalid_arg (Printf.sprintf "Chc.Async.compression: unknown value %d" n)
   ;;
 
+  (* The C encoder writes fixed-width cells straight from Int/Uint/Float/Raw.
+     The wide types arrive as text, so they are turned into wire bytes here —
+     in OCaml, where the parsing is memory-safe and testable, rather than in the
+     stub. Columns of any other type are passed through untouched. *)
+  let normalize_wide type_name cells =
+    let bare =
+      let p = "Nullable(" in
+      let n = String.length type_name in
+      if n > String.length p && String.sub type_name 0 (String.length p) = p && type_name.[n - 1] = ')'
+      then String.sub type_name (String.length p) (n - String.length p - 1)
+      else type_name
+    in
+    let kind_ordinal, elem, scale = type_info_raw bare in
+    let convert =
+      match Kind.of_int kind_ordinal with
+      | Kind.UUID ->
+        Some
+          (function
+            | Uuid u -> Raw (uuid_of_string u)
+            | Str u -> Raw (uuid_of_string u)
+            | v -> v)
+      | Kind.IPv4 ->
+        Some
+          (function
+            | Ip a -> Uint (ipv4_of_string a)
+            | Str a -> Uint (ipv4_of_string a)
+            | v -> v)
+      | Kind.IPv6 ->
+        Some
+          (function
+            | Ip a -> Raw (ipv6_of_string a)
+            | Str a -> Raw (ipv6_of_string a)
+            | v -> v)
+      | Kind.Int128 | Kind.Int256 | Kind.UInt128 | Kind.UInt256 ->
+        Some
+          (function
+            | Big d -> Raw (bignum_of_string ~width:elem d)
+            | Str d -> Raw (bignum_of_string ~width:elem d)
+            | Int i -> Raw (bignum_of_string ~width:elem (Int64.to_string i))
+            | Uint u -> Raw (bignum_of_string ~width:elem (Printf.sprintf "%Lu" u))
+            | v -> v)
+      | Kind.Decimal32 | Kind.Decimal64 | Kind.Decimal128 | Kind.Decimal256 ->
+        Some
+          (function
+            | Decimal d -> Raw (bignum_of_string ~width:elem (mantissa_of_decimal ~scale d))
+            | Str d -> Raw (bignum_of_string ~width:elem (mantissa_of_decimal ~scale d))
+            | v -> v)
+      | _ -> None
+    in
+    match convert with
+    | None -> cells
+    | Some f -> Array.map (fun v -> if v = Null then Null else f v) cells
+  ;;
+
   let send_block t ~names ~types ~columns ~n_rows =
     check t;
+    let columns = Array.mapi (fun c cells -> normalize_wide types.(c) cells) columns in
     send_block_raw t.h names types columns n_rows
   ;;
 end

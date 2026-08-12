@@ -85,9 +85,25 @@ Numeric, string, date/time, `Nullable`, `Array`, `Tuple`, `Map` and
 surfaces as an array of pairs, matching its physical `Array(Tuple(K, V))`
 layout.
 
-Types with no lossless OCaml counterpart — 128/256-bit integers and decimals,
-`UUID`, `IPv6`, `BFloat16` — come back as `Raw` holding little-endian wire
-bytes rather than being lossily coerced. `JSON`, `Dynamic`, `Variant` and
+Types wider than any OCaml integer render to exact text rather than being
+truncated:
+
+| ClickHouse | OCaml | Example |
+|---|---|---|
+| `Int128`/`Int256`/`UInt128`/`UInt256` | `Big` | `"-170141183460469231731687303715884105728"` |
+| `Decimal32/64/128/256` | `Decimal` | `"1.2345"` |
+| `UUID` | `Uuid` | `"61f0c404-5cb3-11e7-907b-a6006ad3dba0"` |
+| `IPv4`/`IPv6` | `Ip` | `"192.168.1.1"`, `"2001:db8::1"` |
+
+These match ClickHouse's own rendering byte for byte, which the tests assert by
+comparing every decode against the server's `toString` of the same expression —
+including `Int128` at its minimum, `UInt256` at its maximum, RFC 5952 `::`
+compression and IPv4-mapped `IPv6`. Decimals print in shortest exact form
+(trailing fractional zeros dropped, then the point), which is what both
+`toString` and TSV column output do.
+
+`Raw` remains the fallback for anything still unmodelled, holding little-endian
+wire bytes rather than a guess. `JSON`, `Dynamic`, `Variant` and
 `AggregateFunction` are not decodable at all: upstream does not support them in
 v1.
 
@@ -143,9 +159,15 @@ instead of hiding it, since it is the cheapest way to learn a result's schema.
 
 ## Writing
 
-The write path covers fixed-width leaves, `String`, and `Nullable` of either.
-`Array`, `Tuple`, `Map` and `LowCardinality` decode but do not yet encode, and
-raise rather than silently mis-encoding.
+The write path covers fixed-width leaves, `String`, the wide types above, and
+`Nullable` of any of them. `Array`, `Tuple`, `Map` and `LowCardinality` decode
+but do not yet encode, and raise rather than silently mis-encoding.
+
+Wide values are parsed from text back to wire bytes in OCaml rather than in the
+stub, where the parsing is memory-safe and testable; the C encoder only ever
+sees fixed-width bytes. Round-trips are verified against the server's own
+interpretation (`WHERE u = toUUID(...)`), not just against our own decoder,
+which would pass even if encode and decode were symmetrically wrong.
 
 Rows are transposed and shipped in batches (default 65536) rather than as one
 block, flushing between batches — sends never block, so nothing else applies
@@ -164,7 +186,7 @@ protocol violation later.
 2. ~~Async client over OCaml sockets: handshake, query, block streaming, via
    `clickhouse-async.h`.~~ Done.
 3. ~~Insert path (`chc_block_builder`) and LZ4/ZSTD compression.~~ Done.
-4. Wide types: 128/256-bit integers and decimals, `UUID`, `IPv6` as first-class
-   values.
+4. ~~Wide types: 128/256-bit integers and decimals, `UUID`, `IPv4`/`IPv6` as
+   first-class values, both directions.~~ Done.
 5. Composite writes: `Array`, `Tuple`, `Map`, `LowCardinality`.
 6. Lwt / Eio drivers — replace `Chc.Client`'s pump, reuse everything else.
