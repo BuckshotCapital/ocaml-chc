@@ -3,9 +3,9 @@
 OCaml bindings to [clickhouse-c](https://github.com/ClickHouse/clickhouse-c),
 ClickHouse's header-only C client for the Native wire format.
 
-**Status: stage 2.** Queries over the native TCP protocol work, as does block
-decoding from a file descriptor. Tested against a live ClickHouse 26.5 and
-against `clickhouse local` output. No INSERT path and no compression yet.
+**Status: usable.** Queries, INSERTs and LZ4/ZSTD compression over the native
+TCP protocol, plus block decoding from a file descriptor. Tested against a live
+ClickHouse 26.5 and against `clickhouse local` output.
 
 ```ocaml
 let c = Chc.Client.connect ~password "clickhouse.internal" in
@@ -21,6 +21,24 @@ Streaming, for results that should not be materialised:
 ```ocaml
 Chc.Client.query_iter c "SELECT number FROM numbers(10_000_000)" ~f:(fun b ->
     Array.iter consume (Chc.column b 0))
+```
+
+Writing. Column types come from the schema block the server returns for the
+INSERT, so the wire types are always the server's own:
+
+```ocaml
+Chc.Client.insert c "events" [|
+  [| Chc.Uint 1L; Chc.Str "hello"; Chc.Float 1.5 |];
+  [| Chc.Uint 2L; Chc.Str "world"; Chc.Null   |];
+|]
+```
+
+Compression is off unless asked for, and `Chc.Client.compression` reports what
+was actually negotiated rather than what you requested:
+
+```ocaml
+let c = Chc.Client.connect ~compression:`Lz4 ~password host in
+assert (Chc.Client.compression c = `Lz4)
 ```
 
 Reading `FORMAT Native` bytes off a descriptor, with no server involved:
@@ -39,9 +57,9 @@ client paths: `clickhouse-client.h` (owns the socket) and
 submits bytes and drains an output buffer). We bind the latter. That means no
 blocking C call ever holds the OCaml runtime lock, no threads are involved, TLS
 can come from `ocaml-tls` instead of the OpenSSL header, and the same core
-works under Unix, Lwt and Eio with a small per-scheduler transport shim. Stage
-1 uses the fd-backed reader for convenience, releasing the runtime lock around
-the blocking read.
+works under Unix, Lwt and Eio with a small per-scheduler transport shim.
+`Chc.Client` is just the blocking driver over it. The separate fd reader does
+block in C, and releases the runtime lock around the read.
 
 **Hand-written C stubs, not ctypes.** The library is header-only, so a C
 translation unit is required regardless — stubs are therefore free. More
@@ -100,8 +118,9 @@ The flake pins OCaml 5.4 and ClickHouse 26.7 (cached for aarch64-darwin, so it
 downloads rather than builds). Point `CLICKHOUSE_BIN` at another binary to test
 against a different version.
 
-Compression codecs are compiled out (`CHC_NO_LZ4` / `CHC_NO_ZSTD`), so the
-library links nothing beyond libc. The TCP path will need them.
+The library links `lz4` and `zstd`, both supplied by the flake. They stay
+dormant until a codec is requested at connect time — `clickhouse-client.h:434`
+downgrades to `CHC_COMP_NONE` whenever `opts->codec` is NULL.
 
 ## Vendoring
 
@@ -122,16 +141,30 @@ returns `NULL`. `Chc.column` returns `[||]` for it rather than dereferencing
 that, and `Chc.column_layout` raises. `query_iter` passes the block through
 instead of hiding it, since it is the cheapest way to learn a result's schema.
 
+## Writing
+
+The write path covers fixed-width leaves, `String`, and `Nullable` of either.
+`Array`, `Tuple`, `Map` and `LowCardinality` decode but do not yet encode, and
+raise rather than silently mis-encoding.
+
+Rows are transposed and shipped in batches (default 65536) rather than as one
+block, flushing between batches — sends never block, so nothing else applies
+backpressure.
+
+If an INSERT fails partway, the server is left mid-statement and would reject
+the next query. `insert` terminates the stream so the connection stays usable;
+blocks the server already accepted stay committed, which is inherent to a
+streaming insert. If even that recovery fails the connection is marked poisoned
+and refuses further use with a comprehensible error instead of surfacing a
+protocol violation later.
+
 ## Roadmap
 
 1. ~~Block decoder over an fd, no TCP.~~ Done.
 2. ~~Async client over OCaml sockets: handshake, query, block streaming, via
    `clickhouse-async.h`.~~ Done.
-3. Wide types: 128/256-bit integers and decimals, `UUID`, `IPv6` as first-class
+3. ~~Insert path (`chc_block_builder`) and LZ4/ZSTD compression.~~ Done.
+4. Wide types: 128/256-bit integers and decimals, `UUID`, `IPv6` as first-class
    values.
-4. Insert path (`chc_block_builder`).
-5. Compression — now just a flag: link lz4/zstd, drop `CHC_NO_*`, call
-   `chc_lz4_codec_init`, set `chc_client_opts.codec`. The client negotiates
-   `CHC_COMP_NONE` while `codec` is NULL, which is why the uncompressed path
-   needed no codec linked.
+5. Composite writes: `Array`, `Tuple`, `Map`, `LowCardinality`.
 6. Lwt / Eio drivers — replace `Chc.Client`'s pump, reuse everything else.

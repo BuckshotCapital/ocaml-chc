@@ -8,4 +8,8 @@
   ; The CHC_* configuration macros live in chc_stubs.c so the translation unit
   ; is self-describing; setting them here too only earns -Wmacro-redefined.
   (flags
-   (:standard -std=c11))))
+   (:standard -std=c11)))
+ ; Block compression codecs. The client still negotiates CHC_COMP_NONE unless a
+ ; codec is passed at connect time, so these are latent until asked for.
+ (c_library_flags
+  (-llz4 -lzstd)))

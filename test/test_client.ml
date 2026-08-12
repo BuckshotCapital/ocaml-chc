@@ -51,6 +51,7 @@ let run host =
   let si = Chc.Client.server_info c in
   check "server name non-empty" (String.length si.Chc.Async.server_name > 0);
   check "revision negotiated" (si.Chc.Async.revision > 0);
+  check "no compression by default" (Chc.Client.compression c = `None);
   Printf.printf
     "  (server %s %d.%d.%d rev %d)\n"
     si.Chc.Async.server_name
@@ -111,7 +112,84 @@ let run host =
   print_endline "empty result";
   let _, empty = Chc.Client.query_rows c "SELECT 1 WHERE 0" in
   check_eq "no rows" ~expected:"0" ~actual:(string_of_int (Array.length empty));
-  Chc.Client.close c
+  print_endline "insert round-trip";
+  let tbl = Printf.sprintf "chc_test_%d" (Unix.getpid ()) in
+  let drop () =
+    try Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s" tbl) with
+    | _ -> ()
+  in
+  drop ();
+  Chc.Client.execute
+    c
+    (Printf.sprintf
+       "CREATE TABLE %s (id UInt32, name String, score Float64, flag UInt8, note Nullable(String), big Int64) ENGINE = Memory"
+       tbl);
+  let n = 5000 in
+  let rows =
+    Array.init n (fun i ->
+      [| Chc.Uint (Int64.of_int i)
+       ; Chc.Str (Printf.sprintf "row-%d" i)
+       ; Chc.Float (float_of_int i /. 4.)
+       ; Chc.Uint (if i mod 2 = 0 then 1L else 0L)
+       ; (if i mod 3 = 0 then Chc.Null else Chc.Str "note")
+       ; Chc.Int (Int64.of_int (-i))
+      |])
+  in
+  Chc.Client.insert c tbl rows;
+  check_eq "row count" ~expected:(string_of_int n) ~actual:(one_value c (Printf.sprintf "SELECT count() FROM %s" tbl));
+  check_eq "uint sum" ~expected:"12497500" ~actual:(one_value c (Printf.sprintf "SELECT sum(id) FROM %s" tbl));
+  check_eq "negative int sum" ~expected:"-12497500" ~actual:(one_value c (Printf.sprintf "SELECT sum(big) FROM %s" tbl));
+  check_eq "string round-trip" ~expected:"row-42" ~actual:(one_value c (Printf.sprintf "SELECT name FROM %s WHERE id = 42" tbl));
+  check_eq "float round-trip" ~expected:"2." ~actual:(one_value c (Printf.sprintf "SELECT score FROM %s WHERE id = 8" tbl));
+  check_eq "nulls preserved" ~expected:"1667" ~actual:(one_value c (Printf.sprintf "SELECT count() FROM %s WHERE note IS NULL" tbl));
+  check_eq "non-nulls preserved" ~expected:"3333" ~actual:(one_value c (Printf.sprintf "SELECT count() FROM %s WHERE note IS NOT NULL" tbl));
+  print_endline "insert with an explicit column subset";
+  Chc.Client.execute c (Printf.sprintf "TRUNCATE TABLE %s" tbl);
+  Chc.Client.insert c tbl ~columns:[ "id"; "name" ] [| [| Chc.Uint 7L; Chc.Str "seven" |] |];
+  check_eq "subset insert" ~expected:"seven" ~actual:(one_value c (Printf.sprintf "SELECT name FROM %s WHERE id = 7" tbl));
+  check_eq "unlisted column defaulted" ~expected:"0." ~actual:(one_value c (Printf.sprintf "SELECT score FROM %s WHERE id = 7" tbl));
+  print_endline "unsupported write type is refused, not mis-encoded";
+  Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s_arr" tbl);
+  Chc.Client.execute c (Printf.sprintf "CREATE TABLE %s_arr (a Array(UInt8)) ENGINE = Memory" tbl);
+  (match Chc.Client.insert c (tbl ^ "_arr") [| [| Chc.Arr [| Chc.Uint 1L |] |] |] with
+   | () ->
+     incr failures;
+     print_endline "  FAIL Array insert silently accepted"
+   | exception Chc.Error e ->
+     check "Array insert raises" true;
+     Printf.printf "  (%s)\n" e.Chc.Error.msg);
+  check_eq "connection survives a failed insert" ~expected:"9" ~actual:(one_value c "SELECT 9");
+  Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s_arr" tbl);
+  drop ();
+  Chc.Client.close c;
+  (* Same data, LZ4 on. Exercises both directions: the client compresses the
+     Data blocks it sends and decompresses the ones the server returns. *)
+  print_endline "lz4 compression round-trip";
+  let cz =
+    Chc.Client.connect
+      ~port:(int_of_string (env "CHC_TEST_PORT" "9000"))
+      ~user:(env "CHC_TEST_USER" "default")
+      ~password:(env "CHC_TEST_PASSWORD" "")
+      ~database:(env "CHC_TEST_DATABASE" "default")
+      ~compression:`Lz4
+      host
+  in
+  check "lz4 actually negotiated" (Chc.Client.compression cz = `Lz4);
+  let ztbl = tbl ^ "_lz4" in
+  Chc.Client.execute cz (Printf.sprintf "DROP TABLE IF EXISTS %s" ztbl);
+  Chc.Client.execute cz (Printf.sprintf "CREATE TABLE %s (id UInt64, pad String) ENGINE = Memory" ztbl);
+  let zn = 200_000 in
+  let pad = String.make 64 'x' in
+  let zrows = Array.init zn (fun i -> [| Chc.Uint (Int64.of_int i); Chc.Str pad |]) in
+  Chc.Client.insert cz ztbl zrows;
+  check_eq "compressed insert count" ~expected:(string_of_int zn) ~actual:(one_value cz (Printf.sprintf "SELECT count() FROM %s" ztbl));
+  check_eq "compressed insert sum" ~expected:"19999900000" ~actual:(one_value cz (Printf.sprintf "SELECT sum(id) FROM %s" ztbl));
+  check_eq "compressed string intact" ~expected:pad ~actual:(one_value cz (Printf.sprintf "SELECT pad FROM %s LIMIT 1" ztbl));
+  let zread = ref 0 in
+  Chc.Client.query_iter cz (Printf.sprintf "SELECT id, pad FROM %s" ztbl) ~f:(fun b -> zread := !zread + Chc.n_rows b);
+  check_eq "compressed select streamed back" ~expected:(string_of_int zn) ~actual:(string_of_int !zread);
+  Chc.Client.execute cz (Printf.sprintf "DROP TABLE IF EXISTS %s" ztbl);
+  Chc.Client.close cz
 ;;
 
 let () =

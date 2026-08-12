@@ -17,6 +17,13 @@
     {
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
+          # buildInputs (not packages) so the cc wrapper puts their include and
+          # lib dirs on the compiler's search path for the C stubs.
+          buildInputs = [
+            pkgs.lz4
+            pkgs.zstd
+          ];
+
           packages = [
             pkgs.ocaml
             pkgs.dune_3

@@ -1,9 +1,9 @@
 /* chc_stubs.c — OCaml bindings for clickhouse-c, block decode path.
  *
  * This is the single translation unit that compiles the header-only library:
- * CHC_IMPLEMENTATION is defined here and nowhere else. Codecs are off — the
- * stage-1 path (FORMAT Native over an fd) never sees a compressed frame, so
- * there is no link-time dependency beyond libc.
+ * CHC_IMPLEMENTATION is defined here and nowhere else. LZ4 and ZSTD are
+ * compiled in and linked (see the dune c_library_flags), but stay dormant: the
+ * client negotiates CHC_COMP_NONE unless the caller passes a codec.
  *
  * Memory model: a chc_block owns its whole column tree, and every chc_column*
  * is interior to it. Column and type pointers therefore cross into OCaml as
@@ -15,16 +15,11 @@
 
 #define CHC_PROVIDE_STDLIB_ALLOC
 #define CHC_IMPLEMENTATION
-#define CHC_NO_LZ4
-#define CHC_NO_ZSTD
 
 #include "clickhouse.h"
 #include "clickhouse-posix-io.h"
 
-/* clickhouse-client.h pulls in clickhouse-compression.h, which is why the
- * CHC_NO_* guards above are load-bearing: without them it wants lz4.h/zstd.h.
- * The client negotiates CHC_COMP_NONE whenever opts->codec is NULL, so the
- * uncompressed TCP path needs no codec linked. */
+#include "clickhouse-compression.h"
 #include "clickhouse-client.h"
 #include "clickhouse-async.h"
 
@@ -540,6 +535,9 @@ typedef struct {
      * `c->cli.al = al`) rather than copying it, so it has to outlive the
      * client. Passing a stack chc_alloc to init would be a use-after-free. */
     chc_alloc al;
+    /* Same again for the codec: clickhouse-client.h:435 does
+     * `c->codec = opts->codec`, keeping the pointer rather than the struct. */
+    chc_codec codec;
     int open;
 } chc_async_box;
 
@@ -576,8 +574,12 @@ static chc_async_box *async_of(value v) {
     return box;
 }
 
-CAMLprim value chc_stub_async_create(value vname, value vdb, value vuser, value vpass, value vbufsz) {
+/* vcomp: 0 none, 1 LZ4, 2 ZSTD — matches chc_compression. Six arguments, so
+ * OCaml needs the native entry plus a bytecode trampoline (declared in chc.ml
+ * as `external ... = "chc_stub_async_create_bytecode" "chc_stub_async_create"`). */
+CAMLprim value chc_stub_async_create(value vname, value vdb, value vuser, value vpass, value vbufsz, value vcomp) {
     CAMLparam5(vname, vdb, vuser, vpass, vbufsz);
+    CAMLxparam1(vcomp);
     CAMLlocal1(v);
 
     chc_async_box *box = calloc(1, sizeof *box);
@@ -597,6 +599,24 @@ CAMLprim value chc_stub_async_create(value vname, value vdb, value vuser, value 
     opts.password = String_val(vpass);
     opts.read_buffer_bytes = (size_t) Long_val(vbufsz);
 
+    switch (Long_val(vcomp)) {
+    case CHC_COMP_NONE:
+        break;
+    case CHC_COMP_LZ4:
+        chc_lz4_codec_init(&box->codec);
+        opts.codec = &box->codec;
+        opts.compression = CHC_COMP_LZ4;
+        break;
+    case CHC_COMP_ZSTD:
+        chc_zstd_codec_init(&box->codec);
+        opts.codec = &box->codec;
+        opts.compression = CHC_COMP_ZSTD;
+        break;
+    default:
+        free(box);
+        caml_invalid_argument("Chc.Async.create: unknown compression");
+    }
+
     chc_err err = {0};
     if (chc_async_client_init(&box->c, &opts, &box->al, &err) != CHC_OK) {
         free(box);
@@ -607,6 +627,11 @@ CAMLprim value chc_stub_async_create(value vname, value vdb, value vuser, value 
     v = caml_alloc_custom_mem(&async_ops, sizeof(chc_async_box *), sizeof *box);
     Async_val(v) = box;
     CAMLreturn(v);
+}
+
+CAMLprim value chc_stub_async_create_bytecode(value *argv, int argn) {
+    (void) argn;
+    return chc_stub_async_create(argv[0], argv[1], argv[2], argv[3], argv[4], argv[5]);
 }
 
 CAMLprim value chc_stub_async_close(value vh) {
@@ -685,6 +710,16 @@ CAMLprim value chc_stub_async_consume_out(value vh, value vn) {
     chc_async_box *box = async_of(vh);
     chc_async_consume_out(box->c, (size_t) Long_val(vn));
     CAMLreturn(Val_unit);
+}
+
+/* The compression the client actually negotiated, read back off the client
+ * rather than echoed from what we passed in. clickhouse-client.h:434 downgrades
+ * to CHC_COMP_NONE whenever opts->codec is NULL, so this is what distinguishes
+ * "LZ4 is on" from "we asked for LZ4 and it silently did nothing". */
+CAMLprim value chc_stub_async_compression(value vh) {
+    CAMLparam1(vh);
+    chc_async_box *box = async_of(vh);
+    CAMLreturn(Val_long((long) box->c->cli.compression));
 }
 
 CAMLprim value chc_stub_async_server_info(value vh) {
@@ -815,4 +850,240 @@ CAMLprim value chc_stub_async_recv_packet(value vh) {
     res = caml_alloc(1, 0); /* Some */
     Store_field(res, 0, pay);
     CAMLreturn(res);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Block writing (INSERT)                                                     */
+/* -------------------------------------------------------------------------- */
+
+/* Tags of Chc.value's non-constant constructors, in declaration order. Null is
+ * the only constant constructor, so Is_long(v) identifies it. Mirrors the type
+ * in chc.ml — keep the two in step. */
+enum {
+    VAL_BOOL = 0,
+    VAL_INT = 1,
+    VAL_UINT = 2,
+    VAL_FLOAT = 3,
+    VAL_STR = 4,
+    VAL_RAW = 5,
+    VAL_ARR = 6,
+    VAL_TUP = 7,
+};
+
+/* Per-column scratch. Every buffer here is referenced by the chc_column tree
+ * and must stay alive until chc_async_send_data has serialised the block into
+ * the client's out buffer, which it does synchronously. */
+typedef struct {
+    chc_type *ty;
+    uint8_t *fixed;
+    uint8_t *sdata;
+    uint64_t *soff;
+    uint8_t *nulls;
+    chc_column leaf;
+    chc_column outer;
+} ins_col;
+
+static void ins_col_free(ins_col *ic, const chc_alloc *al) {
+    if (ic->ty) {
+        chc_type_destroy(ic->ty, al);
+    }
+    free(ic->fixed);
+    free(ic->sdata);
+    free(ic->soff);
+    free(ic->nulls);
+    memset(ic, 0, sizeof *ic);
+}
+
+/* Little-endian on the wire regardless of host, matching the decoder's use of
+ * String.get_intNN_le. Widths above 8 bytes sign- or zero-extend, so Int128 and
+ * friends round-trip through Raw. */
+static void put_le(uint8_t *dst, size_t elem, uint64_t bits, int negative) {
+    size_t k = 0;
+    for (; k < elem && k < 8; k++) {
+        dst[k] = (uint8_t) ((bits >> (8 * k)) & 0xffu);
+    }
+    for (; k < elem; k++) {
+        dst[k] = negative ? 0xffu : 0x00u;
+    }
+}
+
+static int encode_fixed_cell(uint8_t *dst, size_t elem, value v, chc_err *err) {
+    memset(dst, 0, elem);
+    if (Is_long(v)) {
+        return CHC_OK; /* Null: placeholder, the null map carries the truth */
+    }
+    switch (Tag_val(v)) {
+    case VAL_BOOL:
+        dst[0] = Bool_val(Field(v, 0)) ? 1u : 0u;
+        return CHC_OK;
+    case VAL_INT: {
+        int64_t x = Int64_val(Field(v, 0));
+        put_le(dst, elem, (uint64_t) x, x < 0);
+        return CHC_OK;
+    }
+    case VAL_UINT:
+        put_le(dst, elem, (uint64_t) Int64_val(Field(v, 0)), 0);
+        return CHC_OK;
+    case VAL_FLOAT: {
+        double d = Double_val(Field(v, 0));
+        if (elem == 4) {
+            float f = (float) d;
+            uint32_t bits;
+            memcpy(&bits, &f, sizeof bits);
+            put_le(dst, elem, bits, 0);
+        } else {
+            uint64_t bits;
+            memcpy(&bits, &d, sizeof bits);
+            put_le(dst, elem, bits, 0);
+        }
+        return CHC_OK;
+    }
+    case VAL_STR:
+    case VAL_RAW: {
+        /* FixedString and the wide types: copy what fits, zero-padded. */
+        value s = Field(v, 0);
+        size_t n = caml_string_length(s);
+        memcpy(dst, String_val(s), n < elem ? n : elem);
+        return CHC_OK;
+    }
+    default:
+        snprintf(err->msg, sizeof err->msg, "cannot encode an array or tuple into a fixed column");
+        return CHC_ERR_TYPE;
+    }
+}
+
+/* Builds one column tree over freshly allocated slabs.
+ *
+ * Returns a status rather than raising: the caller allocates several of these
+ * in a loop, and a longjmp out of the middle would strand every slab already
+ * allocated. All errors come back through err. */
+static int build_column(ins_col *ic, value vtype, value vcells, size_t n_rows, const chc_alloc *al, chc_err *err) {
+    int rc = chc_type_parse(String_val(vtype), caml_string_length(vtype), al, &ic->ty, err);
+    if (rc != CHC_OK) {
+        return rc;
+    }
+
+    int nullable = chc_type_kind(ic->ty) == CHC_NULLABLE;
+    const chc_type *leaf_ty = nullable ? chc_type_child(ic->ty, 0) : ic->ty;
+
+    if (chc_type_kind(leaf_ty) == CHC_STRING) {
+        size_t total = 0;
+        for (size_t i = 0; i < n_rows; i++) {
+            value v = Field(vcells, i);
+            if (!Is_long(v) && (Tag_val(v) == VAL_STR || Tag_val(v) == VAL_RAW)) {
+                total += caml_string_length(Field(v, 0));
+            }
+        }
+        ic->sdata = malloc(total ? total : 1);
+        ic->soff = malloc((n_rows ? n_rows : 1) * sizeof *ic->soff);
+        if (!ic->sdata || !ic->soff) {
+            snprintf(err->msg, sizeof err->msg, "out of memory building a string column");
+            return CHC_ERR_OOM;
+        }
+        size_t at = 0;
+        for (size_t i = 0; i < n_rows; i++) {
+            value v = Field(vcells, i);
+            if (!Is_long(v) && (Tag_val(v) == VAL_STR || Tag_val(v) == VAL_RAW)) {
+                value s = Field(v, 0);
+                size_t n = caml_string_length(s);
+                memcpy(ic->sdata + at, String_val(s), n);
+                at += n;
+            }
+            ic->soff[i] = at;
+        }
+        ic->leaf = chc_build_string(ic->soff, ic->sdata, n_rows);
+    } else {
+        size_t elem = chc_type_elem_size(leaf_ty);
+        if (elem == 0) {
+            char buf[96];
+            (void) chc_type_format(leaf_ty, buf, sizeof buf);
+            snprintf(err->msg, sizeof err->msg, "INSERT does not support column type %s yet", buf);
+            return CHC_ERR_TYPE;
+        }
+        ic->fixed = malloc((n_rows ? n_rows : 1) * elem);
+        if (!ic->fixed) {
+            snprintf(err->msg, sizeof err->msg, "out of memory building a fixed column");
+            return CHC_ERR_OOM;
+        }
+        for (size_t i = 0; i < n_rows; i++) {
+            rc = encode_fixed_cell(ic->fixed + i * elem, elem, Field(vcells, i), err);
+            if (rc != CHC_OK) {
+                return rc;
+            }
+        }
+        ic->leaf = chc_build_fixed(ic->fixed, elem, n_rows);
+    }
+
+    if (nullable) {
+        ic->nulls = malloc(n_rows ? n_rows : 1);
+        if (!ic->nulls) {
+            snprintf(err->msg, sizeof err->msg, "out of memory building a null map");
+            return CHC_ERR_OOM;
+        }
+        for (size_t i = 0; i < n_rows; i++) {
+            ic->nulls[i] = Is_long(Field(vcells, i)) ? 1u : 0u;
+        }
+        ic->outer = chc_build_nullable(ic->nulls, &ic->leaf);
+    } else {
+        ic->outer = ic->leaf;
+    }
+    return CHC_OK;
+}
+
+/* Send one Data block. vcols is an array of columns, each itself a value array.
+ *
+ * Self-contained on purpose: the builders reference caller-owned slabs that must
+ * outlive the write, so allocation, construction, send and teardown all happen
+ * inside this one call rather than being exposed to OCaml as separate steps. */
+CAMLprim value chc_stub_async_send_block(value vh, value vnames, value vtypes, value vcols, value vnrows) {
+    CAMLparam5(vh, vnames, vtypes, vcols, vnrows);
+
+    chc_async_box *box = async_of(vh);
+    size_t n_cols = (size_t) Wosize_val(vnames);
+    size_t n_rows = (size_t) Long_val(vnrows);
+
+    if ((size_t) Wosize_val(vtypes) != n_cols || (size_t) Wosize_val(vcols) != n_cols) {
+        caml_invalid_argument("Chc: names/types/columns length mismatch");
+    }
+
+    ins_col *ic = calloc(n_cols ? n_cols : 1, sizeof *ic);
+    chc_block_col *storage = calloc(n_cols ? n_cols : 1, sizeof *storage);
+    if (!ic || !storage) {
+        free(ic);
+        free(storage);
+        caml_raise_out_of_memory();
+    }
+
+    chc_block_builder bb;
+    chc_block_builder_init(&bb, storage);
+    bb.n_rows = n_rows;
+
+    chc_err err = {0};
+    int rc = CHC_OK;
+    size_t built = 0;
+    for (; built < n_cols && rc == CHC_OK; built++) {
+        rc = build_column(&ic[built], Field(vtypes, built), Field(vcols, built), n_rows, &box->al, &err);
+        if (rc == CHC_OK) {
+            chc_block_builder_append(&bb, String_val(Field(vnames, built)), caml_string_length(Field(vnames, built)), ic[built].ty,
+                                     &ic[built].outer);
+        } else {
+            built++; /* this column allocated too — free it along with the rest */
+            break;
+        }
+    }
+
+    if (rc == CHC_OK) {
+        rc = chc_async_send_data(box->c, &bb, &err);
+    }
+
+    for (size_t i = 0; i < built && i < n_cols; i++) {
+        ins_col_free(&ic[i], &box->al);
+    }
+    free(ic);
+    free(storage);
+
+    if (rc != CHC_OK) {
+        chc_raise_error(rc, &err);
+    }
+    CAMLreturn(Val_unit);
 }

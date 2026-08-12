@@ -1,10 +1,11 @@
 (** OCaml bindings to {{:https://github.com/ClickHouse/clickhouse-c}clickhouse-c}.
 
-    Stage 1: decoding the ClickHouse Native wire format from a file descriptor — a [clickhouse local --format Native] pipe, a captured
-    [.native] dump, or anything else emitting bare blocks. No TCP, no compression, no codecs linked.
+    Two entry points: {!Client} runs queries and INSERTs over the native TCP protocol, and {!open_fd} decodes bare [FORMAT Native] blocks
+    off a descriptor with no server involved.
 
-    The TCP client is deliberately absent: the eventual network path binds [clickhouse-async.h], which never touches a socket, so sockets
-    and TLS stay on the OCaml side and the same core works under Unix, Lwt and Eio. *)
+    The network path binds [clickhouse-async.h], which never touches a socket, so sockets and TLS stay on the OCaml side and the same core
+    works under Unix, Lwt and Eio — {!Client} is just the blocking driver over it. LZ4 and ZSTD are linked but dormant unless asked for at
+    connect time. *)
 
 (** {1 Errors} *)
 
@@ -239,7 +240,15 @@ module Async : sig
     | Profile_info of profile_info
 
   (** Allocates only; performs no I/O and cannot fail on the network. *)
-  val create : ?client_name:string -> ?database:string -> ?user:string -> ?password:string -> ?read_buffer_bytes:int -> unit -> t
+  val create
+    :  ?client_name:string
+    -> ?database:string
+    -> ?user:string
+    -> ?password:string
+    -> ?read_buffer_bytes:int
+    -> ?compression:[ `None | `Lz4 | `Zstd ]
+    -> unit
+    -> t
 
   (** [true] once the Hello exchange completes. [false] means the input buffer
       drained mid-parse: submit more bytes and call again. Parse state survives
@@ -272,6 +281,11 @@ module Async : sig
   (** Meaningful only after {!handshake} returns [true]. *)
   val server_info : t -> server_info
 
+  (** What the client actually negotiated, read back off the client rather than
+      echoed from {!create}'s argument — passing a codec that fails to take
+      silently degrades to [`None], and this is what tells the two apart. *)
+  val compression : t -> [ `None | `Lz4 | `Zstd ]
+
   val close : t -> unit
 end
 
@@ -293,6 +307,7 @@ module Client : sig
     -> ?client_name:string
     -> ?read_buffer_bytes:int
     -> ?socket_buffer_bytes:int
+    -> ?compression:[ `None | `Lz4 | `Zstd ]
     -> string
     -> t
 
@@ -311,6 +326,24 @@ module Client : sig
   val query_rows : t -> string -> string array * value array array
 
   val ping : t -> unit
+
+  (** Run a statement and discard its output. *)
+  val execute : t -> string -> unit
+
+  (** [insert t table rows] with [rows] row-major. Column types come from the
+      schema block the server returns for the INSERT, so the wire types are
+      always the server's own; [columns] restricts and orders the target
+      columns exactly as it would in SQL.
+
+      Rows are transposed and shipped in batches of [batch_size] (default
+      65536) rather than as one block, and the out buffer is flushed between
+      batches — sends never block, so nothing else applies backpressure.
+
+      @raise Error on a server-side rejection, or on a column type the writer
+      does not support. See {!Async.send_block}. *)
+  val insert : ?columns:string list -> ?batch_size:int -> t -> string -> value array array -> unit
+
   val server_info : t -> Async.server_info
+  val compression : t -> [ `None | `Lz4 | `Zstd ]
   val close : t -> unit
 end

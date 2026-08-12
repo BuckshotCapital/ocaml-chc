@@ -576,7 +576,18 @@ module Async = struct
     | Progress of progress
     | Profile_info of profile_info
 
-  external create_raw : string -> string -> string -> string -> int -> handle = "chc_stub_async_create"
+  (* Six arguments, hence the bytecode trampoline alongside the native entry. *)
+  external create_raw
+    :  string
+    -> string
+    -> string
+    -> string
+    -> int
+    -> int
+    -> handle
+    = "chc_stub_async_create_bytecode" "chc_stub_async_create"
+
+  external send_block_raw : handle -> string array -> string array -> value array array -> int -> unit = "chc_stub_async_send_block"
   external close_raw : handle -> unit = "chc_stub_async_close"
   external handshake_raw : handle -> bool = "chc_stub_async_handshake"
   external send_query_raw : handle -> string -> string -> unit = "chc_stub_async_send_query"
@@ -585,6 +596,7 @@ module Async = struct
   external pending_out_raw : handle -> string = "chc_stub_async_pending_out"
   external consume_out_raw : handle -> int -> unit = "chc_stub_async_consume_out"
   external server_info_raw : handle -> server_info = "chc_stub_async_server_info"
+  external compression_raw : handle -> int = "chc_stub_async_compression"
   external recv_packet_raw : handle -> packet option = "chc_stub_async_recv_packet"
 
   type t =
@@ -592,8 +604,23 @@ module Async = struct
     ; mutable closed : bool
     }
 
-  let create ?(client_name = "ocaml-chc") ?(database = "default") ?(user = "default") ?(password = "") ?(read_buffer_bytes = 0) () =
-    { h = create_raw client_name database user password read_buffer_bytes; closed = false }
+  (* Ordinals match chc_compression. *)
+  let int_of_compression = function
+    | `None -> 0
+    | `Lz4 -> 1
+    | `Zstd -> 2
+  ;;
+
+  let create
+        ?(client_name = "ocaml-chc")
+        ?(database = "default")
+        ?(user = "default")
+        ?(password = "")
+        ?(read_buffer_bytes = 0)
+        ?(compression = `None)
+        ()
+    =
+    { h = create_raw client_name database user password read_buffer_bytes (int_of_compression compression); closed = false }
   ;;
 
   let check t = if t.closed then invalid_arg "Chc.Async: client is closed"
@@ -644,6 +671,20 @@ module Async = struct
     check t;
     recv_packet_raw t.h
   ;;
+
+  let compression t =
+    check t;
+    match compression_raw t.h with
+    | 0 -> `None
+    | 1 -> `Lz4
+    | 2 -> `Zstd
+    | n -> invalid_arg (Printf.sprintf "Chc.Async.compression: unknown value %d" n)
+  ;;
+
+  let send_block t ~names ~types ~columns ~n_rows =
+    check t;
+    send_block_raw t.h names types columns n_rows
+  ;;
 end
 
 (* -------------------------------------------------------------------------- *)
@@ -656,6 +697,11 @@ module Client = struct
     ; a : Async.t
     ; buf : Bytes.t
     ; mutable closed : bool
+    ; (* Set when an INSERT fails and the stream could not be wound back to a
+         clean point. The server is then mid-statement and would reject the
+         next Query packet, so refuse up front with a comprehensible error
+         rather than surfacing a protocol violation later. *)
+      mutable poisoned : bool
     }
 
   let server_error where (e : Async.exn_info) =
@@ -694,6 +740,7 @@ module Client = struct
         ?(client_name = "ocaml-chc")
         ?(read_buffer_bytes = 0)
         ?(socket_buffer_bytes = 65536)
+        ?(compression = `None)
         host
     =
     let ai = resolve host port in
@@ -703,8 +750,8 @@ module Client = struct
        Unix.close sock;
        raise e);
     Unix.setsockopt sock Unix.TCP_NODELAY true;
-    let a = Async.create ~client_name ~database ~user ~password ~read_buffer_bytes () in
-    let t = { sock; a; buf = Bytes.create socket_buffer_bytes; closed = false } in
+    let a = Async.create ~client_name ~database ~user ~password ~read_buffer_bytes ~compression () in
+    let t = { sock; a; buf = Bytes.create socket_buffer_bytes; closed = false; poisoned = false } in
     let rec drive () =
       if Async.handshake t.a
       then ()
@@ -720,7 +767,10 @@ module Client = struct
     t
   ;;
 
-  let check t = if t.closed then invalid_arg "Chc.Client: connection is closed"
+  let check t =
+    if t.closed then invalid_arg "Chc.Client: connection is closed";
+    if t.poisoned then invalid_arg "Chc.Client: connection was left mid-INSERT by an earlier failure; reconnect"
+  ;;
 
   let close t =
     if not t.closed
@@ -733,6 +783,11 @@ module Client = struct
   let server_info t =
     check t;
     Async.server_info t.a
+  ;;
+
+  let compression t =
+    check t;
+    Async.compression t.a
   ;;
 
   (* Drains the response stream to End_of_stream, handing every Data block that
@@ -779,4 +834,83 @@ module Client = struct
     check t;
     ignore (query t "SELECT 1")
   ;;
+
+  (* INSERT drives the protocol in the other direction: the server answers the
+     query with a schema-only block describing the target columns, and we reply
+     with Data blocks shaped to match. Taking the types from that reply rather
+     than asking the caller for them means the wire types are always the
+     server's own. *)
+  let insert ?columns ?(batch_size = 65536) t table rows =
+    check t;
+    let collist =
+      match columns with
+      | None -> ""
+      | Some cs -> " (" ^ String.concat ", " cs ^ ")"
+    in
+    Async.send_query t.a (Printf.sprintf "INSERT INTO %s%s VALUES" table collist);
+    let rec await_schema () =
+      match Async.recv_packet t.a with
+      | None ->
+        pump t;
+        await_schema ()
+      | Some (Async.Data b) -> b
+      | Some (Async.Exception e) -> server_error "insert failed" e
+      | Some Async.End_of_stream -> invalid_arg "Chc.Client.insert: server closed the stream before sending a schema"
+      | Some _ -> await_schema ()
+    in
+    let schema = await_schema () in
+    let n_cols = n_columns schema in
+    let names = Array.init n_cols (column_name schema) in
+    let types = Array.init n_cols (column_type_name schema) in
+    let total = Array.length rows in
+    Array.iteri
+      (fun r row ->
+         if Array.length row <> n_cols
+         then invalid_arg (Printf.sprintf "Chc.Client.insert: row %d has %d values, expected %d" r (Array.length row) n_cols))
+      rows;
+    (* Transpose into columns a batch at a time: the wire format is columnar,
+       and one giant block would hold the whole input in memory twice. *)
+    let rec send_batch start =
+      if start < total
+      then (
+        let n = min batch_size (total - start) in
+        let columns = Array.init n_cols (fun c -> Array.init n (fun r -> rows.(start + r).(c))) in
+        Async.send_block t.a ~names ~types ~columns ~n_rows:n;
+        (* Flush so the out buffer does not grow without bound — sends never
+           block, so nothing else applies backpressure. *)
+        while String.length (Async.pending_out t.a) > 0 do
+          pump t
+        done;
+        send_batch (start + n))
+    in
+    let rec finish () =
+      match Async.recv_packet t.a with
+      | None ->
+        pump t;
+        finish ()
+      | Some Async.End_of_stream -> ()
+      | Some (Async.Exception e) -> server_error "insert failed" e
+      | Some _ -> finish ()
+    in
+    let sent_end = ref false in
+    (try
+       send_batch 0;
+       Async.send_data_end t.a;
+       sent_end := true
+     with
+     | e ->
+       (* The server is mid-INSERT waiting for Data. Terminate the stream so the
+          connection stays usable; blocks it already accepted stay committed,
+          which is inherent to a streaming insert. If even that fails there is
+          no way back, so poison the connection. *)
+       (try
+          if not !sent_end then Async.send_data_end t.a;
+          finish ()
+        with
+        | _ -> t.poisoned <- true);
+       raise e);
+    finish ()
+  ;;
+
+  let execute t sql = query_iter t sql ~f:(fun _ -> ())
 end
