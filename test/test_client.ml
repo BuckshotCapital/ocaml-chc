@@ -137,6 +137,33 @@ let run host =
   print_endline "empty result";
   let _, empty = Chc.Client.query_rows c "SELECT 1 WHERE 0" in
   check_eq "no rows" ~expected:"0" ~actual:(string_of_int (Array.length empty));
+  print_endline "typed fetch over the wire";
+  let module R = Chc.Row in
+  let numbered =
+    let open R in
+    let+ n = field "n" int
+    and+ label = field "label" string in
+    Printf.sprintf "%d:%s" n label
+  in
+  let got = Chc.Client.fetch c "SELECT number AS n, concat('r', toString(number)) AS label FROM numbers(3)" numbered in
+  check_eq "fetch decodes rows" ~expected:"0:r0;1:r1;2:r2" ~actual:(String.concat ";" got);
+  check_eq
+    "fetch_one"
+    ~expected:"Some 41:answer"
+    ~actual:
+      (match Chc.Client.fetch_one c "SELECT 41 AS n, 'answer' AS label" numbered with
+       | Some x -> "Some " ^ x
+       | None -> "None");
+  check_eq
+    "fetch_one on empty"
+    ~expected:"None"
+    ~actual:
+      (match Chc.Client.fetch_one c "SELECT 1 AS n, 'x' AS label WHERE 0" numbered with
+       | Some x -> "Some " ^ x
+       | None -> "None");
+  let streamed = ref 0 in
+  Chc.Client.fetch_iter c "SELECT number AS n, 'x' AS label FROM numbers(120000)" numbered ~f:(fun _ -> incr streamed);
+  check_eq "fetch_iter streams every row" ~expected:"120000" ~actual:(string_of_int !streamed);
   print_endline "insert round-trip";
   let tbl = Printf.sprintf "chc_test_%d" (Unix.getpid ()) in
   let drop () =

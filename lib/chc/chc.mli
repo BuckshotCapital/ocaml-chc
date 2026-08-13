@@ -159,6 +159,79 @@ val columns : block -> value array array
 (** Row-major transpose of {!columns}. Convenient, not efficient. *)
 val rows : block -> value array array
 
+(** {1 Typed row decoding}
+
+    Turns a block's [value array]s into records, resolving columns by name so a
+    change in [SELECT] order cannot silently reinterpret a row.
+
+    {[
+      type spread = { asset : string; adj : float; mkts : int }
+
+      let spread =
+        let open Chc.Row in
+        let+ asset = field "asset" string
+        and+ adj = field "adj_pct" float
+        and+ mkts = field "mkts" int in
+        { asset; adj; mkts }
+      ;;
+
+      let top = Chc.Client.fetch c "SELECT ..." spread
+    ]} *)
+
+module Row : sig
+  (** Carries the column name, its ClickHouse type, the row index, what was
+      expected and what was found. *)
+  exception Decode_error of string
+
+  (** How to read one cell. *)
+  type 'a conv
+
+  val string : string conv
+
+  (** Any value, via its canonical rendering. *)
+  val text : string conv
+
+  val int : int conv
+  val int64 : int64 conv
+
+  (** Integers are promoted, since aggregates flip between [UInt64] and
+      [Float64] depending on the function. *)
+  val float : float conv
+
+  (** Accepts a real [Bool], or [UInt8] 0/1. *)
+  val bool : bool conv
+
+  val uuid : string conv
+  val ip : string conv
+  val big : string conv
+  val decimal : string conv
+  val raw : string conv
+  val value : value conv
+  val opt : 'a conv -> 'a option conv
+  val array : 'a conv -> 'a array conv
+  val pair : 'a conv -> 'b conv -> ('a * 'b) conv
+  val map_conv : ('a -> 'b) -> 'a conv -> 'b conv
+
+  (** A whole-row decoder. *)
+  type 'a t
+
+  (** @raise Decode_error if no column has that name, listing the ones that do. *)
+  val field : string -> 'a conv -> 'a t
+
+  (** Positional, for columns whose generated name is awkward. *)
+  val at : int -> 'a conv -> 'a t
+
+  val const : 'a -> 'a t
+  val map : ('a -> 'b) -> 'a t -> 'b t
+  val both : 'a t -> 'b t -> ('a * 'b) t
+  val ( let+ ) : 'a t -> ('a -> 'b) -> 'b t
+  val ( and+ ) : 'a t -> 'b t -> ('a * 'b) t
+end
+
+(** Each column is decoded at most once per block, and only if a field names
+    it — selecting ten columns and reading two costs two decodes. *)
+val decode_block : block -> 'a Row.t -> 'a array
+
 (** {1 Readers} *)
 
 type reader
@@ -338,6 +411,16 @@ module Client : sig
   (** Column names plus every row decoded, flattened across blocks. Convenient
       for small results; use {!query_iter} to stream. *)
   val query_rows : t -> string -> string array * value array array
+
+  (** Run [sql] and decode every row. Convenient for results that fit in
+      memory; use {!fetch_iter} to stream. *)
+  val fetch : t -> string -> 'a Row.t -> 'a list
+
+  (** Streaming {!fetch}: [f] is applied per row, block by block. *)
+  val fetch_iter : t -> string -> 'a Row.t -> f:('a -> unit) -> unit
+
+  (** First row only. Note this still drains the response. *)
+  val fetch_one : t -> string -> 'a Row.t -> 'a option
 
   val ping : t -> unit
 

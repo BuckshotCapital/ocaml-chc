@@ -665,6 +665,211 @@ let rows b =
 ;;
 
 (* -------------------------------------------------------------------------- *)
+(* Typed row decoding                                                         *)
+(* -------------------------------------------------------------------------- *)
+
+module Row = struct
+  exception Decode_error of string
+
+  let fail fmt = Printf.ksprintf (fun m -> raise (Decode_error m)) fmt
+
+  (* A cell converter: what it wants, and how to read it. Errors carry
+     [expected] rather than a bare "no" so a mismatch names both sides. *)
+  type 'a conv =
+    { expected : string
+    ; read : value -> 'a option
+    }
+
+  let conv expected read = { expected; read }
+  let map_conv f c = { c with read = (fun v -> Option.map f (c.read v)) }
+
+  let string =
+    conv "String" (function
+      | Str s -> Some s
+      | _ -> None)
+  ;;
+
+  (* Anything at all, via its canonical rendering. Useful for columns whose type
+     you do not want to commit to. *)
+  let text = conv "any value" (fun v -> Some (string_of_value v))
+
+  let int64 =
+    conv "an integer" (function
+      | Int i | Uint i -> Some i
+      | _ -> None)
+  ;;
+
+  let int = map_conv Int64.to_int int64
+
+  (* Integers are promoted, since aggregates flip between UInt64 and Float64
+     depending on the function used. *)
+  let float =
+    conv "a number" (function
+      | Float f -> Some f
+      | Int i -> Some (Int64.to_float i)
+      | Uint u -> Some (Int64.to_float u)
+      | _ -> None)
+  ;;
+
+  (* ClickHouse has a real Bool, but UInt8 0/1 is still the common idiom. *)
+  let bool =
+    conv "Bool" (function
+      | Bool b -> Some b
+      | Uint 0L | Int 0L -> Some false
+      | Uint 1L | Int 1L -> Some true
+      | _ -> None)
+  ;;
+
+  let uuid =
+    conv "UUID" (function
+      | Uuid u -> Some u
+      | _ -> None)
+  ;;
+
+  let ip =
+    conv "an IP address" (function
+      | Ip a -> Some a
+      | _ -> None)
+  ;;
+
+  let big =
+    conv "a wide integer" (function
+      | Big b -> Some b
+      | _ -> None)
+  ;;
+
+  let decimal =
+    conv "a Decimal" (function
+      | Decimal d -> Some d
+      | _ -> None)
+  ;;
+
+  let raw =
+    conv "raw bytes" (function
+      | Raw r -> Some r
+      | _ -> None)
+  ;;
+
+  let value = conv "any value" (fun v -> Some v)
+
+  let opt c =
+    { expected = c.expected ^ " or NULL"
+    ; read =
+        (function
+          | Null -> Some None
+          | v -> Option.map Option.some (c.read v))
+    }
+  ;;
+
+  let array c =
+    { expected = "an array of " ^ c.expected
+    ; read =
+        (function
+          | Arr a ->
+            let out = Array.make (Array.length a) None in
+            let ok = ref true in
+            Array.iteri
+              (fun i v ->
+                 match c.read v with
+                 | Some x -> out.(i) <- Some x
+                 | None -> ok := false)
+              a;
+            if !ok then Some (Array.map Option.get out) else None
+          | _ -> None)
+    }
+  ;;
+
+  let pair a b =
+    { expected = Printf.sprintf "a tuple of (%s, %s)" a.expected b.expected
+    ; read =
+        (function
+          | Tup [| x; y |] ->
+            (match a.read x, b.read y with
+             | Some u, Some v -> Some (u, v)
+             | _ -> None)
+          | _ -> None)
+    }
+  ;;
+
+  (* Columns are decoded once per block and only if a field actually names
+     them, so selecting ten columns and reading two costs two decodes. *)
+  type ctx =
+    { blk : block
+    ; index : (string, int) Hashtbl.t
+    ; cache : value array option array
+    }
+
+  type 'a t = ctx -> int -> 'a
+
+  let ctx_of_block blk =
+    let n = n_columns blk in
+    let index = Hashtbl.create (2 * n) in
+    for i = n - 1 downto 0 do
+      (* downto so the leftmost wins on duplicate names *)
+      Hashtbl.replace index (column_name blk i) i
+    done;
+    { blk; index; cache = Array.make n None }
+  ;;
+
+  let column_of ctx i =
+    match ctx.cache.(i) with
+    | Some c -> c
+    | None ->
+      let c = column ctx.blk i in
+      ctx.cache.(i) <- Some c;
+      c
+  ;;
+
+  let at i c ctx =
+    let n = n_columns ctx.blk in
+    if i < 0 || i >= n then fail "Chc.Row: column %d out of range (block has %d)" i n;
+    let col = column_of ctx i in
+    let name = column_name ctx.blk i in
+    fun row ->
+      match c.read col.(row) with
+      | Some x -> x
+      | None ->
+        fail
+          "Chc.Row: column %S (%s) row %d: expected %s, got %s"
+          name
+          (column_type_name ctx.blk i)
+          row
+          c.expected
+          (string_of_value col.(row))
+  ;;
+
+  let field name c ctx =
+    match Hashtbl.find_opt ctx.index name with
+    | Some i -> at i c ctx
+    | None ->
+      let available = String.concat ", " (List.init (n_columns ctx.blk) (column_name ctx.blk)) in
+      fail "Chc.Row: no column %S; block has [%s]" name available
+  ;;
+
+  let const x _ctx _row = x
+
+  let map f d ctx =
+    let g = d ctx in
+    fun row -> f (g row)
+  ;;
+
+  let both a b ctx =
+    let ga = a ctx
+    and gb = b ctx in
+    fun row -> ga row, gb row
+  ;;
+
+  let ( let+ ) d f = map f d
+  let ( and+ ) = both
+end
+
+let decode_block b d =
+  let ctx = Row.ctx_of_block b in
+  let get = d ctx in
+  Array.init (n_rows b) get
+;;
+
+(* -------------------------------------------------------------------------- *)
 (* Public reader API                                                          *)
 (* -------------------------------------------------------------------------- *)
 
@@ -1170,4 +1375,20 @@ module Client = struct
   ;;
 
   let execute t sql = query_iter t sql ~f:(fun _ -> ())
+
+  (* Schema-only blocks decode to nothing, so they fall out naturally here
+     rather than needing a special case at the call site. *)
+  let fetch_iter t sql d ~f = query_iter t sql ~f:(fun b -> Array.iter f (decode_block b d))
+
+  let fetch t sql d =
+    let acc = ref [] in
+    fetch_iter t sql d ~f:(fun x -> acc := x :: !acc);
+    List.rev !acc
+  ;;
+
+  let fetch_one t sql d =
+    match fetch t sql d with
+    | [] -> None
+    | x :: _ -> Some x
+  ;;
 end

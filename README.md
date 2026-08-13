@@ -16,6 +16,28 @@ Array.iter (fun row ->
 Chc.Client.close c
 ```
 
+Rows decode into records by column name, so a change in `SELECT` order cannot
+silently reinterpret them:
+
+```ocaml
+type spread = { asset : string; adj : float; markets : int }
+
+let spread =
+  let open Chc.Row in
+  let+ asset   = field "asset" string
+  and+ adj     = field "adj" float
+  and+ markets = field "markets" int in
+  { asset; adj; markets }
+
+let top = Chc.Client.fetch c "SELECT asset, adj, markets FROM ..." spread
+```
+
+A missing column or a type mismatch raises `Chc.Row.Decode_error` naming both
+sides — `column "a" (String) row 0: expected an integer, got text`, or
+`no column "nope"; block has [a]`. Each column is decoded at most once per
+block and only if a field names it, so selecting ten and reading two costs two
+decodes.
+
 Streaming, for results that should not be materialised:
 
 ```ocaml
@@ -224,3 +246,10 @@ protocol violation later.
    first-class values, both directions.~~ Done.
 5. Composite writes: `Array`, `Tuple`, `Map`, `LowCardinality`.
 6. Lwt / Eio drivers — replace `Chc.Client`'s pump, reuse everything else.
+
+## Caveat: AggregateFunction columns
+
+`clickhouse-c` v1 cannot decode `AggregateFunction` state, so a column like
+`AggregateFunction(argMax, Float64, DateTime64)` must be merged in SQL —
+`argMaxMerge(state)` returns a plain `Float64` and decodes fine. Selecting the
+raw state will fail. Same for `JSON`, `Dynamic` and `Variant`.
