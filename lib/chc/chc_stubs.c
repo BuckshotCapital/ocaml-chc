@@ -695,6 +695,52 @@ CAMLprim value chc_stub_async_send_query(value vh, value vsql, value vqid) {
     CAMLreturn(Val_unit);
 }
 
+/* Query with server-side parameters bound to {name:Type} placeholders.
+ *
+ * clickhouse-c passes each value through verbatim — the server parses it with
+ * Field::restoreFromDump — so the literal, quoting included, must already be
+ * correct. Chc.Param builds it; nothing here should ever be handed a raw
+ * user string.
+ *
+ * The async client has no send_query_ex of its own, so this reaches the
+ * embedded blocking client the same way chc_async_send_query does. */
+CAMLprim value chc_stub_async_send_query_ex(value vh, value vsql, value vqid, value vparams) {
+    CAMLparam4(vh, vsql, vqid, vparams);
+
+    chc_async_box *box = async_of(vh);
+    size_t n = (size_t) Wosize_val(vparams);
+
+    chc_query_param *ps = NULL;
+    if (n > 0) {
+        ps = calloc(n, sizeof *ps);
+        if (ps == NULL) {
+            caml_raise_out_of_memory();
+        }
+        /* OCaml strings are NUL-terminated behind their length, so String_val
+         * is a valid C string. No OCaml allocation happens in this loop, so
+         * the GC cannot move them underneath the pointers. */
+        for (size_t i = 0; i < n; i++) {
+            value pair = Field(vparams, i);
+            ps[i].name = String_val(Field(pair, 0));
+            ps[i].value = String_val(Field(pair, 1));
+        }
+    }
+
+    chc_query_opts opts = {0};
+    opts.query_id = String_val(vqid);
+    opts.query_id_len = caml_string_length(vqid);
+    opts.params = ps;
+    opts.n_params = n;
+
+    chc_err err = {0};
+    int rc = chc_client_send_query_ex(&box->c->cli, String_val(vsql), caml_string_length(vsql), &opts, &err);
+    free(ps);
+    if (rc != CHC_OK) {
+        chc_raise_error(rc, &err);
+    }
+    CAMLreturn(Val_unit);
+}
+
 /* Terminates a query's data stream (and an INSERT's rows) with an empty block. */
 CAMLprim value chc_stub_async_send_data_end(value vh) {
     CAMLparam1(vh);

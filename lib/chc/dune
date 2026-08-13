@@ -1,5 +1,6 @@
 (library
  (name chc)
+ (public_name chc)
  ; ipaddr is optional. (select) picks the backend by availability; chc_ip.mli
  ; keeps both interchangeable, so the public API is `string` either way and the
  ; dependency never reaches Chc.value. Query which one is live via

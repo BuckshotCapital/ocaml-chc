@@ -247,6 +247,36 @@ protocol violation later.
 5. Composite writes: `Array`, `Tuple`, `Map`, `LowCardinality`.
 6. Lwt / Eio drivers — replace `Chc.Client`'s pump, reuse everything else.
 
+## Query parameters
+
+Values bind server-side via `{name:Type}` placeholders rather than being pasted
+into SQL:
+
+```ocaml
+Chc.Client.fetch c
+  "SELECT * FROM t WHERE venue NOT IN {skip:Array(String)} AND oi >= {floor:Float64}"
+  ~params:[ "skip", Chc.Param.(array (List.map string [ "dydx"; "arcus" ]))
+          ; "floor", Chc.Param.float 100_000. ]
+  row
+```
+
+Two things about this are worth knowing, both measured against 26.5 rather than
+taken from the docs:
+
+- **Every value crosses as a quoted string literal**, whatever the placeholder
+  declares. `{v:Int64}` rejects a bare `42` with *"Couldn't restore Field from
+  dump"* and accepts `'42'`. `clickhouse-client.h` documents the opposite.
+- **The server unescapes the carried literal twice** — once parsing the Field,
+  once parsing the value's own text form. A string containing a backslash comes
+  back corrupted if escaped only once. `Chc.Param` escapes everything to the
+  same depth, so a value containing quotes, backslashes and `; DROP TABLE`
+  round-trips byte for byte.
+
+Because clickhouse-c passes param values through verbatim, going via
+`Chc.Param` is what makes a parameterised query actually safe rather than
+differently-shaped interpolation. Note also that a *malformed* parameter closes
+the connection, unlike an ordinary SQL error.
+
 ## Caveat: AggregateFunction columns
 
 `clickhouse-c` v1 cannot decode `AggregateFunction` state, so a column like

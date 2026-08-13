@@ -164,6 +164,42 @@ let run host =
   let streamed = ref 0 in
   Chc.Client.fetch_iter c "SELECT number AS n, 'x' AS label FROM numbers(120000)" numbered ~f:(fun _ -> incr streamed);
   check_eq "fetch_iter streams every row" ~expected:"120000" ~actual:(string_of_int !streamed);
+  print_endline "query parameters";
+  let module P = Chc.Param in
+  let one_p sql params =
+    let _, rows = Chc.Client.query_rows c ~params sql in
+    if Array.length rows = 0 then "<no rows>" else show rows.(0).(0)
+  in
+  check_eq "string param" ~expected:"hello" ~actual:(one_p "SELECT {v:String}" [ "v", P.string "hello" ]);
+  check_eq "int param" ~expected:"42" ~actual:(one_p "SELECT {v:Int64}" [ "v", P.int 42 ]);
+  check_eq "float param" ~expected:"1.5" ~actual:(one_p "SELECT {v:Float64}" [ "v", P.float 1.5 ]);
+  check_eq "bool param" ~expected:"true" ~actual:(one_p "SELECT {v:Bool}" [ "v", P.bool true ]);
+  check_eq "null param" ~expected:"NULL" ~actual:(one_p "SELECT {v:Nullable(String)}" [ "v", P.null ]);
+  check_eq
+    "array param"
+    ~expected:"2"
+    ~actual:
+      (one_p
+         "SELECT count() FROM (SELECT arrayJoin(['a','b','c']) x) WHERE x IN {vs:Array(String)}"
+         [ ("vs", P.(array (List.map string [ "a"; "c" ]))) ]);
+  (* The value is carried as a Field literal the server parses, so quoting is
+     the binding's responsibility. A string that would break out of the literal
+     must come back as data, byte for byte. *)
+  let hostile = "o'brien\\x'; DROP TABLE t; --\n\ttail" in
+  check_eq "hostile string survives as data" ~expected:hostile ~actual:(one_p "SELECT {v:String}" [ "v", P.string hostile ]);
+  check_eq
+    "hostile string length preserved"
+    ~expected:(string_of_int (String.length hostile))
+    ~actual:(one_p "SELECT length({v:String})" [ "v", P.string hostile ]);
+  check_eq
+    "hostile string inside an array param"
+    ~expected:"1"
+    ~actual:
+      (one_p
+         "SELECT count() FROM (SELECT {v:String} AS x) WHERE x IN {vs:Array(String)}"
+         [ "v", P.string hostile; ("vs", P.(array [ string hostile ])) ]);
+  (* And the connection is still healthy afterwards. *)
+  check_eq "connection intact after hostile input" ~expected:"5" ~actual:(one_value c "SELECT 5");
   print_endline "insert round-trip";
   let tbl = Printf.sprintf "chc_test_%d" (Unix.getpid ()) in
   let drop () =

@@ -265,6 +265,49 @@ val iter : reader -> (block -> unit) -> unit
 
 val fold : reader -> init:'a -> f:('a -> block -> 'a) -> 'a
 
+(** {1 Query parameters}
+
+    ClickHouse substitutes [{name:Type}] placeholders server-side, but the wire
+    protocol carries each value as a {i Field literal} the server parses with
+    [Field::restoreFromDump] — quoting included. [clickhouse-c] passes the
+    string through untouched, so building that literal correctly is this
+    module's job, and going through it is what makes a parameterised query
+    actually safe rather than differently-shaped interpolation.
+
+    {[
+      Chc.Client.fetch c
+        "SELECT * FROM t WHERE venue NOT IN {skip:Array(String)} AND oi >= {floor:Float64}"
+        ~params:[ "skip", Chc.Param.(array (List.map string [ "dydx"; "arcus" ]))
+                ; "floor", Chc.Param.float 100_000. ]
+        row
+    ]}
+
+    Placeholders substitute {i values}, not identifiers — a table or column name
+    still has to be part of the SQL text. *)
+
+module Param : sig
+  type t
+
+  (** Quoted and escaped. *)
+  val string : string -> t
+
+  val int : int -> t
+  val int64 : int64 -> t
+  val float : float -> t
+  val bool : bool -> t
+  val null : t
+  val array : t list -> t
+  val tuple : t list -> t
+  val opt : ('a -> t) -> 'a option -> t
+
+  (** Emit a Field literal verbatim, for shapes this module does not model. The
+      caller takes back exactly the responsibility the rest of this module
+      exists to remove — never hand it anything user-supplied. *)
+  val unsafe_literal : string -> t
+
+  val to_literal : t -> string
+end
+
 (** {1 Async client}
 
     The sans-IO core: it never touches a socket. Feed it inbound bytes with
@@ -342,8 +385,9 @@ module Async : sig
       the retry. *)
   val handshake : t -> bool
 
-  (** Appends to the out buffer; never blocks. *)
-  val send_query : t -> ?query_id:string -> string -> unit
+  (** Appends to the out buffer; never blocks. [params] bind [{name:Type}]
+      placeholders — see {!Chc.Param}. *)
+  val send_query : t -> ?query_id:string -> ?params:(string * Param.t) list -> string -> unit
 
   (** Appends the empty block terminating an INSERT row stream. *)
   val send_data_end : t -> unit
@@ -403,29 +447,29 @@ module Client : sig
       exists to carry the schema; it is passed through rather than hidden.
 
       @raise Error with [server_code] set if the server returns an exception. *)
-  val query_iter : t -> string -> f:(block -> unit) -> unit
+  val query_iter : t -> ?params:(string * Param.t) list -> string -> f:(block -> unit) -> unit
 
-  val query_fold : t -> string -> init:'a -> f:('a -> block -> 'a) -> 'a
-  val query : t -> string -> block list
+  val query_fold : t -> ?params:(string * Param.t) list -> string -> init:'a -> f:('a -> block -> 'a) -> 'a
+  val query : t -> ?params:(string * Param.t) list -> string -> block list
 
   (** Column names plus every row decoded, flattened across blocks. Convenient
       for small results; use {!query_iter} to stream. *)
-  val query_rows : t -> string -> string array * value array array
+  val query_rows : t -> ?params:(string * Param.t) list -> string -> string array * value array array
 
   (** Run [sql] and decode every row. Convenient for results that fit in
       memory; use {!fetch_iter} to stream. *)
-  val fetch : t -> string -> 'a Row.t -> 'a list
+  val fetch : t -> ?params:(string * Param.t) list -> string -> 'a Row.t -> 'a list
 
   (** Streaming {!fetch}: [f] is applied per row, block by block. *)
-  val fetch_iter : t -> string -> 'a Row.t -> f:('a -> unit) -> unit
+  val fetch_iter : t -> ?params:(string * Param.t) list -> string -> 'a Row.t -> f:('a -> unit) -> unit
 
   (** First row only. Note this still drains the response. *)
-  val fetch_one : t -> string -> 'a Row.t -> 'a option
+  val fetch_one : t -> ?params:(string * Param.t) list -> string -> 'a Row.t -> 'a option
 
   val ping : t -> unit
 
   (** Run a statement and discard its output. *)
-  val execute : t -> string -> unit
+  val execute : t -> ?params:(string * Param.t) list -> string -> unit
 
   (** [insert t table rows] with [rows] row-major. Column types come from the
       schema block the server returns for the INSERT, so the wire types are

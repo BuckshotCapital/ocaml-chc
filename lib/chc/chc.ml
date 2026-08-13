@@ -925,6 +925,91 @@ let fold r ~init ~f =
 ;;
 
 (* -------------------------------------------------------------------------- *)
+(* Query parameters                                                           *)
+(* -------------------------------------------------------------------------- *)
+
+(* ClickHouse substitutes {name:Type} placeholders server-side, but the wire
+   protocol carries each value as a Field literal that the server parses with
+   Field::restoreFromDump — quoting included. clickhouse-c deliberately passes
+   the string through untouched, so building that literal correctly is this
+   module's whole job. Interpolating a user string into SQL, or into a literal,
+   by hand is the thing this exists to avoid. *)
+module Param = struct
+  (* Every value crosses the wire as a *quoted string literal*, whatever the
+     placeholder's declared type: the server casts from text. Measured against
+     26.5 — `{v:Int64}` rejects the bare literal `42` with "Couldn't restore
+     Field from dump" and accepts `'42'`. (clickhouse-client.h documents the
+     opposite, saying to send `42` and `[1,2,3]` unquoted. It does not work.)
+
+     So a value has two renderings: its ClickHouse *text* form, and the escaped
+     literal wrapping it. Inside an array, strings must already be quoted, so a
+     nested string is escaped once for the array text and again for the literal
+     that carries the whole array. Keeping the two apart is the reason this is a
+     variant and not a string. *)
+  type t =
+    | S of string
+    | Lit of string (* numbers and bools: identical in both contexts *)
+    | A of t list
+    | T of t list
+    | Null
+
+  (* Escaped content, without the surrounding quotes. *)
+  let esc s =
+    let b = Buffer.create (String.length s + 8) in
+    String.iter
+      (fun c ->
+         match c with
+         | '\'' -> Buffer.add_string b "\\'"
+         | '\\' -> Buffer.add_string b "\\\\"
+         | '\n' -> Buffer.add_string b "\\n"
+         | '\r' -> Buffer.add_string b "\\r"
+         | '\t' -> Buffer.add_string b "\\t"
+         | '\000' -> Buffer.add_string b "\\0"
+         | c -> Buffer.add_char b c)
+      s;
+    Buffer.contents b
+  ;;
+
+  let quote s = "'" ^ esc s ^ "'"
+
+  (* Inside a container, where a string needs its own quotes. *)
+  let rec nested = function
+    | S s -> quote s
+    | Lit l -> l
+    | Null -> "NULL"
+    | A xs -> "[" ^ String.concat "," (List.map nested xs) ^ "]"
+    | T xs -> "(" ^ String.concat "," (List.map nested xs) ^ ")"
+  ;;
+
+  let string s = S s
+  let int i = Lit (string_of_int i)
+  let int64 i = Lit (Int64.to_string i)
+  let float f = Lit (Printf.sprintf "%.17g" f)
+  let bool b = Lit (if b then "true" else "false")
+  let null = Null
+  let array ps = A ps
+  let tuple ps = T ps
+
+  let opt f = function
+    | None -> Null
+    | Some v -> f v
+  ;;
+
+  let unsafe_literal s = Lit s
+
+  (* The server unescapes the carried literal twice: once parsing the Field,
+     once parsing the value's own text form. Measured against 26.5 — a
+     top-level String containing a backslash came back corrupted when escaped
+     only once, while the identical bytes inside an Array survived, because the
+     array path had already escaped its elements twice. Escaping everything to
+     the same depth is what makes the two agree. *)
+  let to_literal = function
+    | S s -> quote (esc s)
+    | other -> quote (nested other)
+  ;;
+end
+
+(* -------------------------------------------------------------------------- *)
 (* Async client — sans-IO                                                     *)
 (* -------------------------------------------------------------------------- *)
 
@@ -998,6 +1083,7 @@ module Async = struct
   external close_raw : handle -> unit = "chc_stub_async_close"
   external handshake_raw : handle -> bool = "chc_stub_async_handshake"
   external send_query_raw : handle -> string -> string -> unit = "chc_stub_async_send_query"
+  external send_query_ex_raw : handle -> string -> string -> (string * string) array -> unit = "chc_stub_async_send_query_ex"
   external send_data_end_raw : handle -> unit = "chc_stub_async_send_data_end"
   external submit_raw : handle -> Bytes.t -> int -> unit = "chc_stub_async_submit"
   external pending_out_raw : handle -> string = "chc_stub_async_pending_out"
@@ -1044,9 +1130,11 @@ module Async = struct
     handshake_raw t.h
   ;;
 
-  let send_query t ?(query_id = "") sql =
+  let send_query t ?(query_id = "") ?(params = []) sql =
     check t;
-    send_query_raw t.h sql query_id
+    match params with
+    | [] -> send_query_raw t.h sql query_id
+    | ps -> send_query_ex_raw t.h sql query_id (Array.of_list (List.map (fun (k, v) -> k, Param.to_literal v) ps))
   ;;
 
   let send_data_end t =
@@ -1255,9 +1343,9 @@ module Client = struct
   (* Drains the response stream to End_of_stream, handing every Data block that
      carries columns to [f]. The first such block normally has zero rows and
      exists to carry the schema, so it is passed through rather than hidden. *)
-  let query_iter t sql ~f =
+  let query_iter t ?(params = []) sql ~f =
     check t;
-    Async.send_query t.a sql;
+    Async.send_query t.a ~params sql;
     let rec loop () =
       match Async.recv_packet t.a with
       | None ->
@@ -1273,19 +1361,19 @@ module Client = struct
     loop ()
   ;;
 
-  let query_fold t sql ~init ~f =
+  let query_fold t ?(params = []) sql ~init ~f =
     let acc = ref init in
-    query_iter t sql ~f:(fun b -> acc := f !acc b);
+    query_iter t ~params sql ~f:(fun b -> acc := f !acc b);
     !acc
   ;;
 
-  let query t sql = List.rev (query_fold t sql ~init:[] ~f:(fun acc b -> b :: acc))
+  let query t ?(params = []) sql = List.rev (query_fold t ~params sql ~init:[] ~f:(fun acc b -> b :: acc))
 
   (* Every row of every block, decoded, with the column names from the header. *)
-  let query_rows t sql =
+  let query_rows t ?(params = []) sql =
     let names = ref [||] in
     let out =
-      query_fold t sql ~init:[] ~f:(fun acc b ->
+      query_fold t ~params sql ~init:[] ~f:(fun acc b ->
         if Array.length !names = 0 then names := Array.init (n_columns b) (column_name b);
         if n_rows b = 0 then acc else List.rev_append (Array.to_list (rows b)) acc)
     in
@@ -1374,20 +1462,20 @@ module Client = struct
     finish ()
   ;;
 
-  let execute t sql = query_iter t sql ~f:(fun _ -> ())
+  let execute t ?(params = []) sql = query_iter t ~params sql ~f:(fun _ -> ())
 
   (* Schema-only blocks decode to nothing, so they fall out naturally here
      rather than needing a special case at the call site. *)
-  let fetch_iter t sql d ~f = query_iter t sql ~f:(fun b -> Array.iter f (decode_block b d))
+  let fetch_iter t ?(params = []) sql d ~f = query_iter t ~params sql ~f:(fun b -> Array.iter f (decode_block b d))
 
-  let fetch t sql d =
+  let fetch t ?(params = []) sql d =
     let acc = ref [] in
-    fetch_iter t sql d ~f:(fun x -> acc := x :: !acc);
+    fetch_iter t ~params sql d ~f:(fun x -> acc := x :: !acc);
     List.rev !acc
   ;;
 
-  let fetch_one t sql d =
-    match fetch t sql d with
+  let fetch_one t ?(params = []) sql d =
+    match fetch t ~params sql d with
     | [] -> None
     | x :: _ -> Some x
   ;;
