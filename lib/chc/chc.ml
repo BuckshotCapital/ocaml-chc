@@ -1079,7 +1079,14 @@ module Async = struct
     -> handle
     = "chc_stub_async_create_bytecode" "chc_stub_async_create"
 
-  external send_block_raw : handle -> string array -> string array -> value array array -> int -> unit = "chc_stub_async_send_block"
+  (* Mirrors the COL_PLAIN / COL_LC tags in chc_stubs.c. LowCardinality needs a
+     dictionary and per-row indices rather than a flat buffer, and building that
+     wants a hash table — which OCaml has and C does not. *)
+  type encoded_column =
+    | Plain of value array
+    | Lc of value array * int array
+
+  external send_block_raw : handle -> string array -> string array -> encoded_column array -> int -> unit = "chc_stub_async_send_block"
   external close_raw : handle -> unit = "chc_stub_async_close"
   external handshake_raw : handle -> bool = "chc_stub_async_handshake"
   external send_query_raw : handle -> string -> string -> unit = "chc_stub_async_send_query"
@@ -1230,10 +1237,53 @@ module Async = struct
     | Some f -> Array.map (fun v -> if v = Null then Null else f v) cells
   ;;
 
+  (* Dictionary-encode a column. Slot 0 is reserved for the type's default —
+     NULL when the inner type is Nullable, otherwise the empty string — which is
+     the convention the reader and the server both assume. *)
+  let dictionary_encode ~nullable_inner cells =
+    let default = if nullable_inner then Null else Str "" in
+    let index = Hashtbl.create 64 in
+    Hashtbl.replace index default 0;
+    let dict = ref [ default ] in
+    let next = ref 1 in
+    let keys =
+      Array.map
+        (fun v ->
+           match Hashtbl.find_opt index v with
+           | Some i -> i
+           | None ->
+             let i = !next in
+             incr next;
+             Hashtbl.replace index v i;
+             dict := v :: !dict;
+             i)
+        cells
+    in
+    Array.of_list (List.rev !dict), keys
+  ;;
+
+  let lc_inner type_name =
+    let p = "LowCardinality(" in
+    let n = String.length type_name in
+    if n > String.length p && String.sub type_name 0 (String.length p) = p && type_name.[n - 1] = ')'
+    then Some (String.sub type_name (String.length p) (n - String.length p - 1))
+    else None
+  ;;
+
   let send_block t ~names ~types ~columns ~n_rows =
     check t;
-    let columns = Array.mapi (fun c cells -> normalize_wide types.(c) cells) columns in
-    send_block_raw t.h names types columns n_rows
+    let encoded =
+      Array.mapi
+        (fun c cells ->
+           match lc_inner types.(c) with
+           | Some inner ->
+             let nullable_inner = String.length inner >= 9 && String.sub inner 0 9 = "Nullable(" in
+             let dict, keys = dictionary_encode ~nullable_inner (normalize_wide inner cells) in
+             Lc (dict, keys)
+           | None -> Plain (normalize_wide types.(c) cells))
+        columns
+    in
+    send_block_raw t.h names types encoded n_rows
   ;;
 end
 

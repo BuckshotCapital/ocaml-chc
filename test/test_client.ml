@@ -290,6 +290,43 @@ let run host =
     ~expected:"1"
     ~actual:(one_value c (Printf.sprintf "SELECT count() FROM %s WHERE v6 = toIPv6('2001:db8::1')" wtbl));
   Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s" wtbl);
+  print_endline "LowCardinality round-trips through INSERT";
+  let ltbl = tbl ^ "_lc" in
+  Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s" ltbl);
+  Chc.Client.execute
+    c
+    (Printf.sprintf
+       "CREATE TABLE %s (v LowCardinality(String), n Nullable(String), ln LowCardinality(Nullable(String)), i UInt32) ENGINE = Memory"
+       ltbl);
+  (* Repetition is the point — a dictionary with few entries and many rows, plus
+     the empty string, which shares slot 0 with the type default. *)
+  let venues = [| "hyperliquid"; "aster"; "lighter"; ""; "grvt" |] in
+  let lc_rows =
+    Array.init 20000 (fun i ->
+      [| Chc.Str venues.(i mod Array.length venues)
+       ; (if i mod 7 = 0 then Chc.Null else Chc.Str "x")
+       ; (if i mod 5 = 0 then Chc.Null else Chc.Str venues.(i mod Array.length venues))
+       ; Chc.Uint (Int64.of_int i)
+      |])
+  in
+  Chc.Client.insert c ltbl lc_rows;
+  check_eq "row count" ~expected:"20000" ~actual:(one_value c (Printf.sprintf "SELECT count() FROM %s" ltbl));
+  check_eq "distinct dictionary entries" ~expected:"5" ~actual:(one_value c (Printf.sprintf "SELECT uniqExact(v) FROM %s" ltbl));
+  check_eq "empty string survives slot 0" ~expected:"4000" ~actual:(one_value c (Printf.sprintf "SELECT countIf(v = '') FROM %s" ltbl));
+  check_eq
+    "server groups by the LC column"
+    ~expected:"aster:4000"
+    ~actual:(one_value c (Printf.sprintf "SELECT concat(v, ':', toString(count())) FROM %s WHERE v = 'aster' GROUP BY v" ltbl));
+  check_eq
+    "nulls inside LowCardinality(Nullable)"
+    ~expected:"4000"
+    ~actual:(one_value c (Printf.sprintf "SELECT countIf(ln IS NULL) FROM %s" ltbl));
+  check_eq "value at a known row" ~expected:"lighter" ~actual:(one_value c (Printf.sprintf "SELECT v FROM %s WHERE i = 12" ltbl));
+  check_eq
+    "server still reports the column as LowCardinality"
+    ~expected:"LowCardinality(String)"
+    ~actual:(one_value c (Printf.sprintf "SELECT type FROM system.columns WHERE table = '%s' AND name = 'v'" ltbl));
+  Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s" ltbl);
   print_endline "unsupported write type is refused, not mis-encoded";
   Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s_arr" tbl);
   Chc.Client.execute c (Printf.sprintf "CREATE TABLE %s_arr (a Array(UInt8)) ENGINE = Memory" tbl);

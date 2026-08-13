@@ -215,9 +215,21 @@ instead of hiding it, since it is the cheapest way to learn a result's schema.
 
 ## Writing
 
-The write path covers fixed-width leaves, `String`, the wide types above, and
-`Nullable` of any of them. `Array`, `Tuple`, `Map` and `LowCardinality` decode
-but do not yet encode, and raise rather than silently mis-encoding.
+The write path covers fixed-width leaves, `String`, the wide types above,
+`LowCardinality` of either, and `Nullable` of any of them. `Array`, `Tuple` and
+`Map` decode but do not yet encode, and raise rather than silently mis-encoding.
+
+`LowCardinality` is the one column type that is not a straight serialisation —
+it needs a dictionary of distinct values, a per-row index into it, and a key
+width chosen to fit. The dictionary is built in OCaml, where a hash table is
+free; C gets a finished dictionary and index array, so the stub stays a layout
+copy like every other path. Slot 0 is reserved for the type default (`NULL`
+when the inner type is `Nullable`, otherwise the empty string), which is the
+convention the reader and the server both assume.
+
+This matters more than it sounds: `LowCardinality(String)` is how real
+ClickHouse schemas spell every enum-ish column, so without it a driver can read
+a production table but not write one.
 
 Wide values are parsed from text back to wire bytes in OCaml rather than in the
 stub, where the parsing is memory-safe and testable; the C encoder only ever
