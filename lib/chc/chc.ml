@@ -1026,10 +1026,10 @@ module Param = struct
 end
 
 (* -------------------------------------------------------------------------- *)
-(* Async client — sans-IO                                                     *)
+(* Protocol client — sans-IO                                                     *)
 (* -------------------------------------------------------------------------- *)
 
-module Async = struct
+module Protocol = struct
   type handle
 
   type exn_info =
@@ -1144,7 +1144,7 @@ module Async = struct
     { h = create_raw client_name database user password read_buffer_bytes (int_of_compression compression); closed = false }
   ;;
 
-  let check t = if t.closed then invalid_arg "Chc.Async: client is closed"
+  let check t = if t.closed then invalid_arg "Chc.Protocol: client is closed"
 
   let close t =
     if not t.closed
@@ -1201,7 +1201,7 @@ module Async = struct
     | 0 -> `None
     | 1 -> `Lz4
     | 2 -> `Zstd
-    | n -> invalid_arg (Printf.sprintf "Chc.Async.compression: unknown value %d" n)
+    | n -> invalid_arg (Printf.sprintf "Chc.Protocol.compression: unknown value %d" n)
   ;;
 
   let tkind ty = Kind.of_int ty.t_kind
@@ -1383,7 +1383,7 @@ end
 module Client = struct
   type t =
     { sock : Unix.file_descr
-    ; a : Async.t
+    ; a : Protocol.t
     ; buf : Bytes.t
     ; mutable closed : bool
     ; (* Set when an INSERT fails and the stream could not be wound back to a
@@ -1393,7 +1393,7 @@ module Client = struct
       mutable poisoned : bool
     }
 
-  let server_error where (e : Async.exn_info) =
+  let server_error where (e : Protocol.exn_info) =
     raise (Error { code = 0; server_code = e.code; msg = (if e.display_text = "" then where else e.display_text); server_name = e.name })
   ;;
 
@@ -1403,16 +1403,16 @@ module Client = struct
      reading, otherwise a query sitting in the out buffer deadlocks against a
      server that is waiting for it. *)
   let pump t =
-    let out = Async.pending_out t.a in
+    let out = Protocol.pending_out t.a in
     let len = String.length out in
     if len > 0
     then (
       let n = Unix.write_substring t.sock out 0 len in
-      Async.consume_out t.a n)
+      Protocol.consume_out t.a n)
     else (
       let n = Unix.read t.sock t.buf 0 (Bytes.length t.buf) in
       if n = 0 then eof_error ();
-      Async.submit t.a t.buf n)
+      Protocol.submit t.a t.buf n)
   ;;
 
   let resolve host port =
@@ -1439,10 +1439,10 @@ module Client = struct
        Unix.close sock;
        raise e);
     Unix.setsockopt sock Unix.TCP_NODELAY true;
-    let a = Async.create ~client_name ~database ~user ~password ~read_buffer_bytes ~compression () in
+    let a = Protocol.create ~client_name ~database ~user ~password ~read_buffer_bytes ~compression () in
     let t = { sock; a; buf = Bytes.create socket_buffer_bytes; closed = false; poisoned = false } in
     let rec drive () =
-      if Async.handshake t.a
+      if Protocol.handshake t.a
       then ()
       else (
         pump t;
@@ -1450,7 +1450,7 @@ module Client = struct
     in
     (try drive () with
      | e ->
-       Async.close a;
+       Protocol.close a;
        Unix.close sock;
        raise e);
     t
@@ -1465,18 +1465,18 @@ module Client = struct
     if not t.closed
     then (
       t.closed <- true;
-      Async.close t.a;
+      Protocol.close t.a;
       Unix.close t.sock)
   ;;
 
   let server_info t =
     check t;
-    Async.server_info t.a
+    Protocol.server_info t.a
   ;;
 
   let compression t =
     check t;
-    Async.compression t.a
+    Protocol.compression t.a
   ;;
 
   (* Drains the response stream to End_of_stream, handing every Data block that
@@ -1484,17 +1484,17 @@ module Client = struct
      exists to carry the schema, so it is passed through rather than hidden. *)
   let query_iter t ?(params = []) sql ~f =
     check t;
-    Async.send_query t.a ~params sql;
+    Protocol.send_query t.a ~params sql;
     let rec loop () =
-      match Async.recv_packet t.a with
+      match Protocol.recv_packet t.a with
       | None ->
         pump t;
         loop ()
-      | Some Async.End_of_stream -> ()
-      | Some (Async.Data b) ->
+      | Some Protocol.End_of_stream -> ()
+      | Some (Protocol.Data b) ->
         if n_columns b > 0 then f b;
         loop ()
-      | Some (Async.Exception e) -> server_error "query failed" e
+      | Some (Protocol.Exception e) -> server_error "query failed" e
       | Some _ -> loop ()
     in
     loop ()
@@ -1536,15 +1536,15 @@ module Client = struct
       | None -> ""
       | Some cs -> " (" ^ String.concat ", " cs ^ ")"
     in
-    Async.send_query t.a (Printf.sprintf "INSERT INTO %s%s VALUES" table collist);
+    Protocol.send_query t.a (Printf.sprintf "INSERT INTO %s%s VALUES" table collist);
     let rec await_schema () =
-      match Async.recv_packet t.a with
+      match Protocol.recv_packet t.a with
       | None ->
         pump t;
         await_schema ()
-      | Some (Async.Data b) -> b
-      | Some (Async.Exception e) -> server_error "insert failed" e
-      | Some Async.End_of_stream -> invalid_arg "Chc.Client.insert: server closed the stream before sending a schema"
+      | Some (Protocol.Data b) -> b
+      | Some (Protocol.Exception e) -> server_error "insert failed" e
+      | Some Protocol.End_of_stream -> invalid_arg "Chc.Client.insert: server closed the stream before sending a schema"
       | Some _ -> await_schema ()
     in
     let schema = await_schema () in
@@ -1564,27 +1564,27 @@ module Client = struct
       then (
         let n = min batch_size (total - start) in
         let columns = Array.init n_cols (fun c -> Array.init n (fun r -> rows.(start + r).(c))) in
-        Async.send_block t.a ~names ~types ~columns ~n_rows:n;
+        Protocol.send_block t.a ~names ~types ~columns ~n_rows:n;
         (* Flush so the out buffer does not grow without bound — sends never
            block, so nothing else applies backpressure. *)
-        while String.length (Async.pending_out t.a) > 0 do
+        while String.length (Protocol.pending_out t.a) > 0 do
           pump t
         done;
         send_batch (start + n))
     in
     let rec finish () =
-      match Async.recv_packet t.a with
+      match Protocol.recv_packet t.a with
       | None ->
         pump t;
         finish ()
-      | Some Async.End_of_stream -> ()
-      | Some (Async.Exception e) -> server_error "insert failed" e
+      | Some Protocol.End_of_stream -> ()
+      | Some (Protocol.Exception e) -> server_error "insert failed" e
       | Some _ -> finish ()
     in
     let sent_end = ref false in
     (try
        send_batch 0;
-       Async.send_data_end t.a;
+       Protocol.send_data_end t.a;
        sent_end := true
      with
      | e ->
@@ -1593,7 +1593,7 @@ module Client = struct
           which is inherent to a streaming insert. If even that fails there is
           no way back, so poison the connection. *)
        (try
-          if not !sent_end then Async.send_data_end t.a;
+          if not !sent_end then Protocol.send_data_end t.a;
           finish ()
         with
         | _ -> t.poisoned <- true);

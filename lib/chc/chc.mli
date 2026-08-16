@@ -308,15 +308,18 @@ module Param : sig
   val to_literal : t -> string
 end
 
-(** {1 Async client}
+(** {1 Protocol core}
 
     The sans-IO core: it never touches a socket. Feed it inbound bytes with
-    {!Async.submit}, drain outbound bytes with {!Async.pending_out} /
-    {!Async.consume_out}, and drive it from whatever reactor you like. {!Client}
-    is a blocking driver built on this; an Lwt or Eio one would replace only the
-    pump. *)
+    {!Protocol.submit}, drain outbound bytes with {!Protocol.pending_out} /
+    {!Protocol.consume_out}, and drive it from whatever reactor you like.
+    {!Client} is the blocking driver over it, [chc-async] the Async one; each
+    replaces only the pump.
 
-module Async : sig
+    Named for what it is rather than for a scheduler: a driver built on Jane
+    Street's Async has that name in scope already. *)
+
+module Protocol : sig
   type t
 
   type exn_info =
@@ -389,6 +392,19 @@ module Async : sig
       placeholders — see {!Chc.Param}. *)
   val send_query : t -> ?query_id:string -> ?params:(string * Param.t) list -> string -> unit
 
+  (** Append one Data block of an INSERT row stream to the out buffer.
+      [names] and [types] come from the schema block the server answers the
+      INSERT with, so the wire types are its own; [columns] is column-major and
+      every column must hold [n_rows] values.
+
+      Composites take the shapes {!column} produces — see {!Client.insert},
+      which is this plus the statement around it.
+
+      @raise Invalid_argument on a value whose shape does not match its column
+      type, before anything reaches the out buffer.
+      @raise Error on a column type the writer does not support. *)
+  val send_block : t -> names:string array -> types:string array -> columns:value array array -> n_rows:int -> unit
+
   (** Appends the empty block terminating an INSERT row stream. *)
   val send_data_end : t -> unit
 
@@ -427,7 +443,7 @@ module Client : sig
 
   (** Connect over the native TCP protocol (default port 9000) and complete the
       handshake. TLS is not handled here: terminate it in OCaml and drive
-      {!Async} directly.
+      {!Protocol} directly.
 
       @raise Error on handshake or authentication failure. *)
   val connect
@@ -492,7 +508,7 @@ module Client : sig
       does not support. *)
   val insert : ?columns:string list -> ?batch_size:int -> t -> string -> value array array -> unit
 
-  val server_info : t -> Async.server_info
+  val server_info : t -> Protocol.server_info
   val compression : t -> [ `None | `Lz4 | `Zstd ]
   val close : t -> unit
 end

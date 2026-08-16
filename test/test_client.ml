@@ -49,16 +49,16 @@ let run host =
   in
   print_endline "handshake";
   let si = Chc.Client.server_info c in
-  check "server name non-empty" (String.length si.Chc.Async.server_name > 0);
-  check "revision negotiated" (si.Chc.Async.revision > 0);
+  check "server name non-empty" (String.length si.Chc.Protocol.server_name > 0);
+  check "revision negotiated" (si.Chc.Protocol.revision > 0);
   check "no compression by default" (Chc.Client.compression c = `None);
   Printf.printf
     "  (server %s %d.%d.%d rev %d)\n"
-    si.Chc.Async.server_name
-    si.Chc.Async.version_major
-    si.Chc.Async.version_minor
-    si.Chc.Async.version_patch
-    si.Chc.Async.revision;
+    si.Chc.Protocol.server_name
+    si.Chc.Protocol.version_major
+    si.Chc.Protocol.version_minor
+    si.Chc.Protocol.version_patch
+    si.Chc.Protocol.revision;
   print_endline "scalars over the wire";
   check_eq "int" ~expected:"-5" ~actual:(one_value c "SELECT toInt32(-5)");
   check_eq "uint64" ~expected:"42" ~actual:(one_value c "SELECT toUInt64(42)");

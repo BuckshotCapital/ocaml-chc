@@ -26,6 +26,7 @@
 
           packages = [
             pkgs.ocaml
+            pkgs.just
             pkgs.dune_3
             pkgs.ocamlPackages.findlib
             pkgs.ocamlformat
@@ -38,6 +39,12 @@
             # are held to the same tests. Comment it out to exercise the
             # fallback, then check Chc.ip_backend.
             pkgs.ocamlPackages.ipaddr
+
+            # Jane Street Async, for the chc-async driver. The core library
+            # stays stdlib-only; this is a separate package so depending on
+            # `chc` never drags a scheduler in.
+            pkgs.ocamlPackages.async
+            pkgs.ocamlPackages.ppx_let
 
             # clang-format for the C stubs; `make fmt` drives both formatters.
             pkgs.clang-tools

@@ -1,0 +1,9 @@
+; The Async driver replaces Chc.Client's pump and nothing else: block decoding,
+; the writer and the protocol state machine all come from `chc` unchanged.
+
+(library
+ (name chc_async)
+ (public_name chc-async)
+ (libraries chc core async)
+ (preprocess
+  (pps ppx_let)))

@@ -1,6 +1,12 @@
-; test_decode is hermetic (drives `clickhouse local`). test_client needs a live
-; server and skips cleanly when CHC_TEST_HOST is unset.
+; test_decode is hermetic (drives `clickhouse local`). test_client and
+; test_async need a live server and skip cleanly when CHC_TEST_HOST is unset.
 
 (tests
  (names test_decode test_client)
  (libraries chc unix))
+
+(test
+ (name test_async)
+ (libraries chc chc_async core async)
+ (preprocess
+  (pps ppx_let)))

@@ -4,8 +4,9 @@ OCaml bindings to [clickhouse-c](https://github.com/ClickHouse/clickhouse-c),
 ClickHouse's header-only C client for the Native wire format.
 
 **Status: usable.** Queries, INSERTs and LZ4/ZSTD compression over the native
-TCP protocol, plus block decoding from a file descriptor. Tested against a live
-ClickHouse 26.5 and against `clickhouse local` output.
+TCP protocol, plus block decoding from a file descriptor. A Jane Street Async
+driver with a streaming inserter ships alongside as `chc-async`. Tested against
+live ClickHouse 26.5 and 26.7, and against `clickhouse local` output.
 
 ```ocaml
 let c = Chc.Client.connect ~password "clickhouse.internal" in
@@ -79,9 +80,14 @@ client paths: `clickhouse-client.h` (owns the socket) and
 submits bytes and drains an output buffer). We bind the latter. That means no
 blocking C call ever holds the OCaml runtime lock, no threads are involved, TLS
 can come from `ocaml-tls` instead of the OpenSSL header, and the same core
-works under Unix, Lwt and Eio with a small per-scheduler transport shim.
-`Chc.Client` is just the blocking driver over it. The separate fd reader does
-block in C, and releases the runtime lock around the read.
+works under any scheduler with a small per-scheduler transport shim.
+`Chc.Client` is just the blocking driver over it and `chc-async` the Jane
+Street Async one; each replaces the pump and nothing else. The separate fd
+reader does block in C, and releases the runtime lock around the read.
+
+The module is called `Chc.Protocol` rather than `Chc.Async` for the obvious
+reason: a program driving it with Jane Street's Async has that name in scope
+already.
 
 **Hand-written C stubs, not ctypes.** The library is header-only, so a C
 translation unit is required regardless — stubs are therefore free. More
@@ -173,18 +179,27 @@ max.
 
 ```
 direnv allow     # or: nix develop
-make build
-make test        # needs `clickhouse` — the flake provides it
-make fmt         # ocamlformat via `dune fmt`, plus clang-format on the stubs
-make fmt-check   # same, non-mutating; suitable for CI
+just             # lists the recipes
+just build
+just test        # needs `clickhouse` — the flake provides it
+just test-live   # the same, against a server it starts and tears down
+just fmt         # ocamlformat via `dune fmt`, plus clang-format on the stubs
+just fmt-check   # same, non-mutating; suitable for CI
 ```
 
 `test/test_decode.ml` is hermetic — it drives `clickhouse local`, which the
-flake supplies. `test/test_client.ml` needs a live server and is opt-in via
-`CHC_TEST_HOST`; unset, it reports skipped and passes, so a checkout with no
-server still builds green. It runs only against `numbers()` and literals, so it
-works on any server and hardcodes nothing about one. Put real credentials in
-`.envrc.local` (gitignored).
+flake supplies. `test/test_client.ml` and `test/test_async.ml` need a live
+server and are opt-in via `CHC_TEST_HOST`; unset, they report skipped and pass,
+so a checkout with no server still builds green. They run against `numbers()`,
+literals, and tables they create and drop themselves, so they work on any
+server and hardcode nothing about one. Put real credentials in `.envrc.local`
+(gitignored).
+
+The live tests create and drop tables, so point them at something disposable
+rather than at an instance you care about. `just test-live` is that path: it
+starts a ClickHouse from the flake in a temp directory, overrides every
+`CHC_TEST_*` variable `.envrc.local` may have set, runs the suite and tears the
+server down again.
 
 The flake pins OCaml 5.4 and ClickHouse 26.7 (cached for aarch64-darwin, so it
 downloads rather than builds). Point `CLICKHOUSE_BIN` at another binary to test
@@ -282,7 +297,58 @@ protocol violation later.
 4. ~~Wide types: 128/256-bit integers and decimals, `UUID`, `IPv4`/`IPv6` as
    first-class values, both directions.~~ Done.
 5. ~~Composite writes: `Array`, `Tuple`, `Map`, `LowCardinality`.~~ Done.
-6. Lwt / Eio drivers — replace `Chc.Client`'s pump, reuse everything else.
+6. ~~Jane Street Async driver, with a streaming inserter.~~ Done — `chc-async`.
+7. Lwt / Eio drivers — the same shim again, if anyone wants them.
+
+## Async driver
+
+`chc-async` is a separate package: `chc` itself is stdlib-only, and a consumer
+that just wants to read blocks should not have to build a scheduler to do it.
+
+Results arrive as a pipe, so the consumer drives the read — the connection
+stops pulling from the socket while the pipe is full, rather than accumulating
+blocks in memory:
+
+```ocaml
+let%bind conn = Chc_async.connect ~password host in
+Pipe.iter (Chc_async.query_pipe conn "SELECT ...") ~f:handle_block
+```
+
+A connection runs one statement at a time; overlapping calls queue rather than
+interleave. Abandoning a pipe early is fine — the rest of the response is
+drained in the background and the connection stays usable.
+
+### Streaming inserts
+
+Finishing an INSERT statement is the expensive part. Measured against a local
+26.7, one `INSERT ... VALUES` costs **~60 ms** however few rows it carries —
+and that is the server's, not the client's: `clickhouse client` pays 61 ms for
+the same statement, against `Null`, `Memory` and `MergeTree` alike, while a
+bare round trip on the same connection is 0.2 ms and `INSERT ... SELECT` is
+0.5 ms.
+
+Pushing another block into a statement that is *already open* costs 0.055 ms.
+So a writer fed by a stream should open once and flush often, which is what
+`Inserter` is:
+
+```ocaml
+let%bind ins = Chc_async.Inserter.create conn "funding_rates" ~max_rows:50_000 in
+Pipe.iter rows ~f:(fun row ->
+  let%bind () = Chc_async.Inserter.write ins (encode row) in
+  Chc_async.Inserter.commit ins)
+```
+
+`commit` flushes only when a threshold is crossed, so it is cheap to call on
+every turn of a select loop, and a periodic tick that calls it is what turns
+time into a flush. The timer stays in the scheduler rather than in here.
+
+The test asserts the property that matters: 20 000 rows over 40 flushes land as
+**one part**, which only happens if the statement stayed open the whole time.
+Closing and reopening per flush costs the same as not batching at all.
+
+An inserter takes its connection over for its lifetime — queries on it raise
+until `close` — so a writer wants its own. There is no rollback: blocks the
+server has accepted stay committed if a later one fails.
 
 ## Query parameters
 
