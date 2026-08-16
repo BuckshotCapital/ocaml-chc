@@ -327,18 +327,156 @@ let run host =
     ~expected:"LowCardinality(String)"
     ~actual:(one_value c (Printf.sprintf "SELECT type FROM system.columns WHERE table = '%s' AND name = 'v'" ltbl));
   Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s" ltbl);
-  print_endline "unsupported write type is refused, not mis-encoded";
+  print_endline "composites round-trip through INSERT";
+  let ctbl = tbl ^ "_comp" in
+  Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s" ctbl);
+  Chc.Client.execute
+    c
+    (Printf.sprintf
+       "CREATE TABLE %s (id UInt32, tags Array(String), nums Array(Int64), opts Array(Nullable(String)), grid Array(Array(UInt16)), pair \
+        Tuple(UInt8, String), named Tuple(a Int32, b Float64), m Map(String, UInt32), mv Map(String, Array(Float64)), lca \
+        Array(LowCardinality(String)), lcn Array(LowCardinality(Nullable(String))), ids Array(UUID), decs Array(Decimal64(4))) ENGINE = \
+        Memory"
+       ctbl);
+  let arr l = Chc.Arr (Array.of_list l) in
+  let pair a b = Chc.Tup [| a; b |] in
+  let comp_rows =
+    [| [| Chc.Uint 0L
+        ; arr [ Chc.Str "a"; Chc.Str "b" ]
+        ; arr [ Chc.Int 1L; Chc.Int (-2L) ]
+        ; arr [ Chc.Str "x"; Chc.Null; Chc.Str "" ]
+        ; arr [ arr [ Chc.Uint 1L; Chc.Uint 2L ]; arr [ Chc.Uint 3L ] ]
+        ; pair (Chc.Uint 7L) (Chc.Str "seven")
+        ; pair (Chc.Int (-1L)) (Chc.Float 2.5)
+        ; arr [ pair (Chc.Str "a") (Chc.Uint 1L); pair (Chc.Str "b") (Chc.Uint 2L) ]
+        ; arr [ pair (Chc.Str "k") (arr [ Chc.Float 1.5; Chc.Float 2.5 ]) ]
+        ; arr [ Chc.Str "hyperliquid"; Chc.Str "aster"; Chc.Str "hyperliquid" ]
+        ; arr [ Chc.Str "hyperliquid"; Chc.Null; Chc.Str "hyperliquid" ]
+        ; arr [ Chc.Uuid "61f0c404-5cb3-11e7-907b-a6006ad3dba0" ]
+        ; arr [ Chc.Decimal "1.2345"; Chc.Decimal "-0.5" ]
+       |]
+       (* Every composite empty, which leaves a zero-length element column
+          under each builder — including the LowCardinality ones, whose body is
+          omitted entirely rather than written empty. *)
+     ; [| Chc.Uint 1L
+        ; arr []
+        ; arr []
+        ; arr []
+        ; arr []
+        ; pair (Chc.Uint 0L) (Chc.Str "")
+        ; pair (Chc.Int 0L) (Chc.Float 0.)
+        ; arr []
+        ; arr []
+        ; arr []
+        ; arr []
+        ; arr []
+        ; arr []
+       |]
+    |]
+  in
+  Chc.Client.insert c ctbl comp_rows;
+  let at0 expr = one_value c (Printf.sprintf "SELECT %s FROM %s WHERE id = 0" expr ctbl) in
+  check_eq "array of string" ~expected:"[a, b]" ~actual:(at0 "tags");
+  check_eq "array of int" ~expected:"[1, -2]" ~actual:(at0 "nums");
+  check_eq "array of nullable" ~expected:"[x, NULL, ]" ~actual:(at0 "opts");
+  check_eq "nested array" ~expected:"[[1, 2], [3]]" ~actual:(at0 "grid");
+  check_eq "tuple" ~expected:"(7, seven)" ~actual:(at0 "pair");
+  check_eq "named tuple" ~expected:"(-1, 2.5)" ~actual:(at0 "named");
+  check_eq "map" ~expected:"[(a, 1), (b, 2)]" ~actual:(at0 "m");
+  check_eq "map of array" ~expected:"[(k, [1.5, 2.5])]" ~actual:(at0 "mv");
+  check_eq "array of lowcardinality" ~expected:"[hyperliquid, aster, hyperliquid]" ~actual:(at0 "lca");
+  check_eq "array of lowcardinality nullable" ~expected:"[hyperliquid, NULL, hyperliquid]" ~actual:(at0 "lcn");
+  check_eq "array of uuid" ~expected:"[61f0c404-5cb3-11e7-907b-a6006ad3dba0]" ~actual:(at0 "ids");
+  check_eq "array of decimal" ~expected:"[1.2345, -0.5]" ~actual:(at0 "decs");
+  (* Round-tripping our own bytes would pass even if both sides were wrong the
+     same way. These make the server interpret what we wrote. *)
+  print_endline "and the server agrees about what was written";
+  check_eq "server indexes the array" ~expected:"-2" ~actual:(at0 "nums[2]");
+  check_eq "server sees the NULL" ~expected:"1" ~actual:(at0 "opts[2] IS NULL");
+  check_eq "server sees the empty string" ~expected:"3" ~actual:(at0 "length(opts)");
+  check_eq "server indexes the nested array" ~expected:"2" ~actual:(at0 "grid[1][2]");
+  check_eq "server reads the tuple field" ~expected:"seven" ~actual:(at0 "pair.2");
+  check_eq "server reads the named tuple field" ~expected:"2.5" ~actual:(at0 "named.b");
+  check_eq "server looks up the map key" ~expected:"2" ~actual:(at0 "m['b']");
+  check_eq "server indexes through a map value" ~expected:"2.5" ~actual:(at0 "mv['k'][2]");
+  check_eq
+    "server matches on an array element"
+    ~expected:"1"
+    ~actual:(one_value c (Printf.sprintf "SELECT count() FROM %s WHERE has(tags, 'b')" ctbl));
+  check_eq
+    "server sorts the LowCardinality array"
+    ~expected:"aster,hyperliquid,hyperliquid"
+    ~actual:(at0 "arrayStringConcat(arraySort(lca), ',')");
+  check_eq "server agrees the uuid is what we meant" ~expected:"1" ~actual:(at0 "ids[1] = toUUID('61f0c404-5cb3-11e7-907b-a6006ad3dba0')");
+  check_eq "server sums the decimals" ~expected:"0.7345" ~actual:(at0 "arraySum(decs)");
+  print_endline "empty composites";
+  let at1 expr = one_value c (Printf.sprintf "SELECT %s FROM %s WHERE id = 1" expr ctbl) in
+  check_eq "empty array decodes as empty" ~expected:"[]" ~actual:(at1 "tags");
+  check_eq "empty map decodes as empty" ~expected:"[]" ~actual:(at1 "m");
+  check_eq "empty LowCardinality array" ~expected:"[]" ~actual:(at1 "lca");
+  check_eq
+    "nothing landed in any of them"
+    ~expected:"0"
+    ~actual:(at1 "length(tags) + length(grid) + length(m) + length(mv) + length(lca) + length(lcn) + length(decs)");
+  check_eq
+    "server still reports the element type as LowCardinality"
+    ~expected:"Array(LowCardinality(String))"
+    ~actual:(one_value c (Printf.sprintf "SELECT type FROM system.columns WHERE table = '%s' AND name = 'lca'" ctbl));
+  Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s" ctbl);
+  (* Offsets are per block, not per insert: a batch boundary resets them, so a
+     row past 65536 lands wrong if they are ever accumulated across blocks. *)
+  print_endline "composites across a batch boundary";
+  let btbl = tbl ^ "_batch" in
+  Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s" btbl);
+  Chc.Client.execute c (Printf.sprintf "CREATE TABLE %s (id UInt32, xs Array(UInt32), m Map(String, UInt8)) ENGINE = Memory" btbl);
+  let bn = 70_000 in
+  let brows =
+    Array.init bn (fun i ->
+      [| Chc.Uint (Int64.of_int i)
+       ; Chc.Arr (Array.init (i mod 4) (fun k -> Chc.Uint (Int64.of_int (i + k))))
+       ; Chc.Arr [| Chc.Tup [| Chc.Str "n"; Chc.Uint (Int64.of_int (i mod 251)) |] |]
+      |])
+  in
+  Chc.Client.insert c btbl brows;
+  check_eq "row count" ~expected:(string_of_int bn) ~actual:(one_value c (Printf.sprintf "SELECT count() FROM %s" btbl));
+  check_eq
+    "element count"
+    ~expected:(string_of_int (Array.fold_left (fun a i -> a + (i mod 4)) 0 (Array.init bn Fun.id)))
+    ~actual:(one_value c (Printf.sprintf "SELECT sum(length(xs)) FROM %s" btbl));
+  check_eq
+    "last row past the boundary is intact"
+    ~expected:"[69999, 70000, 70001]"
+    ~actual:(one_value c (Printf.sprintf "SELECT xs FROM %s WHERE id = 69999" btbl));
+  check_eq
+    "map past the boundary is intact"
+    ~expected:(string_of_int (69999 mod 251))
+    ~actual:(one_value c (Printf.sprintf "SELECT m['n'] FROM %s WHERE id = 69999" btbl));
+  Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s" btbl);
+  print_endline "a mis-shaped value is refused before anything is sent";
   Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s_arr" tbl);
-  Chc.Client.execute c (Printf.sprintf "CREATE TABLE %s_arr (a Array(UInt8)) ENGINE = Memory" tbl);
-  (match Chc.Client.insert c (tbl ^ "_arr") [| [| Chc.Arr [| Chc.Uint 1L |] |] |] with
+  Chc.Client.execute c (Printf.sprintf "CREATE TABLE %s_arr (a Array(String)) ENGINE = Memory" tbl);
+  (match Chc.Client.insert c (tbl ^ "_arr") [| [| Chc.Arr [| Chc.Str "ok" |] |]; [| Chc.Str "not an array" |] |] with
    | () ->
      incr failures;
-     print_endline "  FAIL Array insert silently accepted"
+     print_endline "  FAIL a scalar in an Array column was accepted"
+   | exception Invalid_argument m ->
+     check "scalar into Array raises" true;
+     check "message names the column, the row and both sides" (String.length m > 0);
+     Printf.printf "  (%s)\n" m);
+  check_eq "connection survives a shape error" ~expected:"8" ~actual:(one_value c "SELECT 8");
+  Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s_arr" tbl);
+  print_endline "a type the writer still refuses is refused, not mis-encoded";
+  Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s_geo" tbl);
+  Chc.Client.execute c (Printf.sprintf "CREATE TABLE %s_geo (p Point) ENGINE = Memory" tbl);
+  (match Chc.Client.insert c (tbl ^ "_geo") [| [| Chc.Tup [| Chc.Float 1.; Chc.Float 2. |] |] |] with
+   | () ->
+     incr failures;
+     print_endline "  FAIL Point insert silently accepted"
    | exception Chc.Error e ->
-     check "Array insert raises" true;
+     check "Point insert raises" true;
      Printf.printf "  (%s)\n" e.Chc.Error.msg);
   check_eq "connection survives a failed insert" ~expected:"9" ~actual:(one_value c "SELECT 9");
-  Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s_arr" tbl);
+  Chc.Client.execute c (Printf.sprintf "DROP TABLE IF EXISTS %s_geo" tbl);
   drop ();
   Chc.Client.close c;
   (* Same data, LZ4 on. Exercises both directions: the client compresses the

@@ -505,13 +505,46 @@ CAMLprim value chc_stub_col_lc_dict(value vb, value vc) {
     CAMLreturn(caml_copy_nativeint((intnat) (uintptr_t) d));
 }
 
-/* Parse a printable ClickHouse type on its own, outside any block, and report
- * (kind, elem_size, decimal_scale). The writer needs a column's width and scale
- * to turn Big/Decimal/Uuid/Ip text into wire bytes, and this reuses the C type
- * parser instead of re-implementing type-name parsing in OCaml. */
-CAMLprim value chc_stub_type_info(value vname) {
+/* Copy one parsed type into a Chc.tdesc record: kind, printable name, element
+ * width, decimal scale, children. */
+static value type_desc(const chc_type *t) {
+    CAMLparam0();
+    CAMLlocal3(rec, kids, name);
+
+    size_t n = chc_type_n_children(t);
+    kids = n ? caml_alloc(n, 0) : Atom(0);
+    for (size_t i = 0; i < n; i++) {
+        Store_field(kids, i, type_desc(chc_type_child(t, i)));
+    }
+
+    /* snprintf-style: first call sizes the buffer. */
+    size_t need = chc_type_format(t, NULL, 0);
+    char *buf = malloc(need + 1);
+    if (buf == NULL) {
+        caml_raise_out_of_memory();
+    }
+    (void) chc_type_format(t, buf, need + 1);
+    name = caml_alloc_initialized_string(need, buf);
+    free(buf);
+
+    rec = caml_alloc(5, 0);
+    Store_field(rec, 0, Val_long((long) chc_type_kind(t)));
+    Store_field(rec, 1, name);
+    Store_field(rec, 2, Val_long((long) chc_type_elem_size(t)));
+    Store_field(rec, 3, Val_long((long) chc_type_decimal_scale(t)));
+    Store_field(rec, 4, kids);
+    CAMLreturn(rec);
+}
+
+/* Parse a printable ClickHouse type on its own, outside any block, and hand the
+ * whole tree to OCaml. The writer walks it in step with the values it is given:
+ * Array(LowCardinality(Nullable(String))) decides the shape of three nested
+ * builders, and a column's width and scale are what turn Big/Decimal/Uuid/Ip
+ * text into wire bytes. Reusing the C parser keeps type-name parsing in one
+ * place rather than re-implementing it in OCaml. */
+CAMLprim value chc_stub_type_tree(value vname) {
     CAMLparam1(vname);
-    CAMLlocal1(tup);
+    CAMLlocal1(d);
 
     chc_alloc al = chc_alloc_stdlib();
     chc_type *t = NULL;
@@ -520,12 +553,9 @@ CAMLprim value chc_stub_type_info(value vname) {
         chc_raise_error(CHC_ERR_TYPE, &err);
     }
 
-    tup = caml_alloc(3, 0);
-    Store_field(tup, 0, Val_long((long) chc_type_kind(t)));
-    Store_field(tup, 1, Val_long((long) chc_type_elem_size(t)));
-    Store_field(tup, 2, Val_long((long) chc_type_decimal_scale(t)));
+    d = type_desc(t);
     chc_type_destroy(t, &al);
-    CAMLreturn(tup);
+    CAMLreturn(d);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -925,17 +955,22 @@ CAMLprim value chc_stub_async_recv_packet(value vh) {
 /* Block writing (INSERT)                                                     */
 /* -------------------------------------------------------------------------- */
 
+/* Chc.Async.encoded's non-constant constructors, in declaration order. The
+ * value tree arrives already shaped for the wire: OCaml flattens an Array into
+ * offsets plus its elements, transposes a Tuple into one column per field, and
+ * dictionary-encodes a LowCardinality. All three want a growable buffer or a
+ * hash table, which OCaml has and C does not — so what crosses the boundary is
+ * a layout copy, one column at a time. */
+enum {
+    ENC_PLAIN = 0,
+    ENC_LC = 1,
+    ENC_ARRAY = 2,
+    ENC_TUPLE = 3,
+};
+
 /* Tags of Chc.value's non-constant constructors, in declaration order. Null is
  * the only constant constructor, so Is_long(v) identifies it. Mirrors the type
  * in chc.ml — keep the two in step. */
-/* Chc.encoded_column: Plain of value array | Lc of value array * int array.
- * The dictionary and per-row keys are built in OCaml, where a hash table is
- * free; C has none, and a linear scan would be quadratic in cardinality. */
-enum {
-    COL_PLAIN = 0,
-    COL_LC = 1,
-};
-
 enum {
     VAL_BOOL = 0,
     VAL_INT = 1,
@@ -951,36 +986,62 @@ enum {
     VAL_TUP = 11,
 };
 
-/* Per-column scratch. Every buffer here is referenced by the chc_column tree
- * and must stay alive until chc_async_send_data has serialised the block into
- * the client's out buffer, which it does synchronously. */
-typedef struct {
-    chc_type *ty;
-    /* Value storage. For a plain column this is the column; for
-     * LowCardinality it is the dictionary. */
+/* One node of the column tree under construction, and the slabs it owns. Every
+ * buffer here is referenced by the chc_column tree and must stay alive until
+ * chc_async_send_data has serialised the block into the client's out buffer,
+ * which it does synchronously.
+ *
+ * Nodes are allocated once and never moved: chc_build_array and friends store
+ * interior pointers (&child->col), so a node array that grew by realloc would
+ * dangle every parent that already referenced one of its elements. */
+typedef struct ins_node ins_node;
+struct ins_node {
+    /* Value storage. For a plain node this is the column; for LowCardinality
+     * it is the dictionary. */
     uint8_t *fixed;
     uint8_t *sdata;
     uint64_t *soff;
     uint8_t *nulls;
-    chc_column leaf;
-    chc_column outer;
+    /* Array only: cumulative exclusive ends, one per row at this level. */
+    uint64_t *aoff;
     /* LowCardinality only: per-row index into the dictionary above. */
     uint8_t *keys;
-    chc_column lc;
-    /* Whichever of the above the block builder should reference. Points into
-     * this struct, which is stable — the array is never reallocated. */
-    chc_column *append;
+    /* Tuple only: children by pointer, the shape chc_build_tuple wants. */
+    chc_column **kids;
+    ins_node *children;
+    size_t n_children;
+    /* The wrapper levels of this node: the leaf values, the Nullable over them
+     * when the type has one, and whatever the parent should reference. */
+    chc_column leaf;
+    chc_column wrap;
+    chc_column col;
+};
+
+static void ins_node_free(ins_node *nd) {
+    for (size_t i = 0; i < nd->n_children; i++) {
+        ins_node_free(&nd->children[i]);
+    }
+    free(nd->children);
+    free(nd->kids);
+    free(nd->fixed);
+    free(nd->sdata);
+    free(nd->soff);
+    free(nd->nulls);
+    free(nd->aoff);
+    free(nd->keys);
+    memset(nd, 0, sizeof *nd);
+}
+
+typedef struct {
+    chc_type *ty;
+    ins_node node;
 } ins_col;
 
 static void ins_col_free(ins_col *ic, const chc_alloc *al) {
     if (ic->ty) {
         chc_type_destroy(ic->ty, al);
     }
-    free(ic->fixed);
-    free(ic->sdata);
-    free(ic->soff);
-    free(ic->nulls);
-    free(ic->keys);
+    ins_node_free(&ic->node);
     memset(ic, 0, sizeof *ic);
 }
 
@@ -1042,15 +1103,10 @@ static int encode_fixed_cell(uint8_t *dst, size_t elem, value v, chc_err *err) {
     }
 }
 
-/* Builds one column tree over freshly allocated slabs.
- *
- * Returns a status rather than raising: the caller allocates several of these
- * in a loop, and a longjmp out of the middle would strand every slab already
- * allocated. All errors come back through err. */
 /* Builds a String or fixed-width column over freshly allocated slabs, wrapping
  * it in a null map when [ty] is Nullable. Shared between plain columns and the
- * dictionary of a LowCardinality one. */
-static int build_values(ins_col *ic, const chc_type *ty, value cells, size_t n, chc_err *err) {
+ * dictionary of a LowCardinality one. Leaves the result in nd->wrap. */
+static int build_values(ins_node *nd, const chc_type *ty, value cells, size_t n, chc_err *err) {
     int nullable = chc_type_kind(ty) == CHC_NULLABLE;
     const chc_type *leaf_ty = nullable ? chc_type_child(ty, 0) : ty;
 
@@ -1062,9 +1118,9 @@ static int build_values(ins_col *ic, const chc_type *ty, value cells, size_t n, 
                 total += caml_string_length(Field(v, 0));
             }
         }
-        ic->sdata = malloc(total ? total : 1);
-        ic->soff = malloc((n ? n : 1) * sizeof *ic->soff);
-        if (!ic->sdata || !ic->soff) {
+        nd->sdata = malloc(total ? total : 1);
+        nd->soff = malloc((n ? n : 1) * sizeof *nd->soff);
+        if (!nd->sdata || !nd->soff) {
             snprintf(err->msg, sizeof err->msg, "out of memory building a string column");
             return CHC_ERR_OOM;
         }
@@ -1074,12 +1130,12 @@ static int build_values(ins_col *ic, const chc_type *ty, value cells, size_t n, 
             if (!Is_long(v) && (Tag_val(v) == VAL_STR || Tag_val(v) == VAL_RAW)) {
                 value sv = Field(v, 0);
                 size_t len = caml_string_length(sv);
-                memcpy(ic->sdata + at, String_val(sv), len);
+                memcpy(nd->sdata + at, String_val(sv), len);
                 at += len;
             }
-            ic->soff[i] = at;
+            nd->soff[i] = at;
         }
-        ic->leaf = chc_build_string(ic->soff, ic->sdata, n);
+        nd->leaf = chc_build_string(nd->soff, nd->sdata, n);
     } else {
         size_t elem = chc_type_elem_size(leaf_ty);
         if (elem == 0) {
@@ -1088,32 +1144,32 @@ static int build_values(ins_col *ic, const chc_type *ty, value cells, size_t n, 
             snprintf(err->msg, sizeof err->msg, "INSERT does not support column type %s yet", buf);
             return CHC_ERR_TYPE;
         }
-        ic->fixed = malloc((n ? n : 1) * elem);
-        if (!ic->fixed) {
+        nd->fixed = malloc((n ? n : 1) * elem);
+        if (!nd->fixed) {
             snprintf(err->msg, sizeof err->msg, "out of memory building a fixed column");
             return CHC_ERR_OOM;
         }
         for (size_t i = 0; i < n; i++) {
-            int rc = encode_fixed_cell(ic->fixed + i * elem, elem, Field(cells, i), err);
+            int rc = encode_fixed_cell(nd->fixed + i * elem, elem, Field(cells, i), err);
             if (rc != CHC_OK) {
                 return rc;
             }
         }
-        ic->leaf = chc_build_fixed(ic->fixed, elem, n);
+        nd->leaf = chc_build_fixed(nd->fixed, elem, n);
     }
 
     if (nullable) {
-        ic->nulls = malloc(n ? n : 1);
-        if (!ic->nulls) {
+        nd->nulls = malloc(n ? n : 1);
+        if (!nd->nulls) {
             snprintf(err->msg, sizeof err->msg, "out of memory building a null map");
             return CHC_ERR_OOM;
         }
         for (size_t i = 0; i < n; i++) {
-            ic->nulls[i] = Is_long(Field(cells, i)) ? 1u : 0u;
+            nd->nulls[i] = Is_long(Field(cells, i)) ? 1u : 0u;
         }
-        ic->outer = chc_build_nullable(ic->nulls, &ic->leaf);
+        nd->wrap = chc_build_nullable(nd->nulls, &nd->leaf);
     } else {
-        ic->outer = ic->leaf;
+        nd->wrap = nd->leaf;
     }
     return CHC_OK;
 }
@@ -1133,34 +1189,120 @@ static int lc_key_size(size_t dict_n) {
     return 8;
 }
 
-/* Returns a status rather than raising: the caller allocates several of these
- * in a loop, and a longjmp out of the middle would strand every slab already
- * allocated. All errors come back through err. */
-static int build_column(ins_col *ic, value vtype, value vcol, size_t n_rows, const chc_alloc *al, chc_err *err) {
-    int rc = chc_type_parse(String_val(vtype), caml_string_length(vtype), al, &ic->ty, err);
-    if (rc != CHC_OK) {
-        return rc;
+/* A tag the OCaml encoder cannot produce for this type — the two walk the same
+ * type tree, so this is an internal-consistency guard, not a user error. Those
+ * are caught in OCaml, where the column name and row index are still in hand. */
+static int enc_mismatch(const chc_type *ty, const char *want, chc_err *err) {
+    char buf[96];
+    (void) chc_type_format(ty, buf, sizeof buf);
+    snprintf(err->msg, sizeof err->msg, "%s needs %s, got a differently shaped column", buf, want);
+    return CHC_ERR_USAGE;
+}
+
+static int build_node(ins_node *nd, const chc_type *ty, value venc, size_t n_rows, chc_err *err);
+
+/* A Tuple, and the (K, V) pair a Map is physically an array of. Both read their
+ * child types through the same accessor, so a Map needs no synthesised tuple
+ * type — chc__col_write walks the Map's two children against the tuple column
+ * exactly as this builds it. */
+static int build_tuple_node(ins_node *nd, const chc_type *parent, size_t arity, value venc, size_t n_rows, chc_err *err) {
+    if (Tag_val(venc) != ENC_TUPLE) {
+        return enc_mismatch(parent, "a tuple", err);
+    }
+    value kids = Field(venc, 0);
+    if ((size_t) Wosize_val(kids) != arity) {
+        return enc_mismatch(parent, "one column per field", err);
     }
 
-    if (Tag_val(vcol) == COL_LC) {
-        /* Dictionary and keys arrived pre-built; the inner type is the
-         * LowCardinality's child. */
-        if (chc_type_kind(ic->ty) != CHC_LOW_CARDINALITY) {
-            snprintf(err->msg, sizeof err->msg, "dictionary supplied for a non-LowCardinality column");
-            return CHC_ERR_USAGE;
+    nd->children = calloc(arity ? arity : 1, sizeof *nd->children);
+    nd->kids = calloc(arity ? arity : 1, sizeof *nd->kids);
+    if (!nd->children || !nd->kids) {
+        snprintf(err->msg, sizeof err->msg, "out of memory building a tuple column");
+        return CHC_ERR_OOM;
+    }
+    for (size_t i = 0; i < arity; i++) {
+        /* Count the child before building it, so a failure part-way frees
+         * exactly what was allocated. calloc zeroed the rest. */
+        nd->n_children = i + 1;
+        int rc = build_node(&nd->children[i], chc_type_child(parent, i), Field(kids, i), n_rows, err);
+        if (rc != CHC_OK) {
+            return rc;
         }
-        value vdict = Field(vcol, 0);
-        value vkeys = Field(vcol, 1);
+        nd->kids[i] = &nd->children[i].col;
+    }
+    nd->col = chc_build_tuple(nd->kids, arity);
+    /* chc_build_tuple takes the row count from child 0; say it outright so an
+     * empty tuple still matches the block. */
+    nd->col.n_rows = n_rows;
+    return CHC_OK;
+}
+
+/* Builds one column tree over freshly allocated slabs, descending through
+ * composites.
+ *
+ * Returns a status rather than raising: the caller allocates several of these
+ * in a loop, and a longjmp out of the middle would strand every slab already
+ * allocated. All errors come back through err. */
+static int build_node(ins_node *nd, const chc_type *ty, value venc, size_t n_rows, chc_err *err) {
+    int rc;
+
+    switch (chc_type_kind(ty)) {
+    case CHC_ARRAY:
+    case CHC_MAP: {
+        if (Tag_val(venc) != ENC_ARRAY) {
+            return enc_mismatch(ty, "offsets and an element column", err);
+        }
+        value voff = Field(venc, 0);
+        if ((size_t) Wosize_val(voff) != n_rows) {
+            return enc_mismatch(ty, "one offset per row", err);
+        }
+        nd->aoff = malloc((n_rows ? n_rows : 1) * sizeof *nd->aoff);
+        if (nd->aoff == NULL) {
+            snprintf(err->msg, sizeof err->msg, "out of memory building array offsets");
+            return CHC_ERR_OOM;
+        }
+        for (size_t i = 0; i < n_rows; i++) {
+            nd->aoff[i] = (uint64_t) Long_val(Field(voff, i));
+        }
+        /* Cumulative exclusive ends, so the last one is the element count. */
+        size_t inner_rows = n_rows ? (size_t) nd->aoff[n_rows - 1] : 0;
+
+        nd->children = calloc(1, sizeof *nd->children);
+        if (nd->children == NULL) {
+            snprintf(err->msg, sizeof err->msg, "out of memory building an array column");
+            return CHC_ERR_OOM;
+        }
+        nd->n_children = 1;
+        rc = chc_type_kind(ty) == CHC_MAP ? build_tuple_node(&nd->children[0], ty, 2, Field(venc, 1), inner_rows, err)
+                                          : build_node(&nd->children[0], chc_type_child(ty, 0), Field(venc, 1), inner_rows, err);
+        if (rc != CHC_OK) {
+            return rc;
+        }
+        nd->col = chc_build_array(nd->aoff, n_rows, &nd->children[0].col);
+        return CHC_OK;
+    }
+
+    case CHC_TUPLE:
+        return build_tuple_node(nd, ty, chc_type_n_children(ty), venc, n_rows, err);
+
+    case CHC_LOW_CARDINALITY: {
+        /* Dictionary and keys arrived pre-built; the dictionary's type is the
+         * LowCardinality's child. */
+        if (Tag_val(venc) != ENC_LC) {
+            return enc_mismatch(ty, "a dictionary and keys", err);
+        }
+        value vdict = Field(venc, 0);
+        value vkeys = Field(venc, 1);
         size_t dict_n = (size_t) Wosize_val(vdict);
 
-        rc = build_values(ic, chc_type_child(ic->ty, 0), vdict, dict_n, err);
+        rc = build_values(nd, chc_type_child(ty, 0), vdict, dict_n, err);
         if (rc != CHC_OK) {
             return rc;
         }
 
         int ks = lc_key_size(dict_n);
-        ic->keys = malloc((n_rows ? n_rows : 1) * (size_t) ks);
-        if (ic->keys == NULL) {
+        nd->keys = malloc((n_rows ? n_rows : 1) * (size_t) ks);
+        if (nd->keys == NULL) {
             snprintf(err->msg, sizeof err->msg, "out of memory building LowCardinality keys");
             return CHC_ERR_OOM;
         }
@@ -1174,30 +1316,34 @@ static int build_column(ins_col *ic, value vtype, value vcol, size_t n_rows, con
             /* Host byte order, as the reader expects. */
             switch (ks) {
             case 1:
-                ((uint8_t *) ic->keys)[i] = (uint8_t) k;
+                ((uint8_t *) nd->keys)[i] = (uint8_t) k;
                 break;
             case 2:
-                ((uint16_t *) ic->keys)[i] = (uint16_t) k;
+                ((uint16_t *) nd->keys)[i] = (uint16_t) k;
                 break;
             case 4:
-                ((uint32_t *) ic->keys)[i] = (uint32_t) k;
+                ((uint32_t *) nd->keys)[i] = (uint32_t) k;
                 break;
             default:
-                ((uint64_t *) ic->keys)[i] = k;
+                ((uint64_t *) nd->keys)[i] = k;
                 break;
             }
         }
-        ic->lc = chc_build_lc(ks, ic->keys, n_rows, &ic->outer);
-        ic->append = &ic->lc;
+        nd->col = chc_build_lc(ks, nd->keys, n_rows, &nd->wrap);
         return CHC_OK;
     }
 
-    rc = build_values(ic, ic->ty, Field(vcol, 0), n_rows, err);
-    if (rc != CHC_OK) {
-        return rc;
+    default:
+        if (Tag_val(venc) != ENC_PLAIN) {
+            return enc_mismatch(ty, "a flat column", err);
+        }
+        rc = build_values(nd, ty, Field(venc, 0), n_rows, err);
+        if (rc != CHC_OK) {
+            return rc;
+        }
+        nd->col = nd->wrap;
+        return CHC_OK;
     }
-    ic->append = &ic->outer;
-    return CHC_OK;
 }
 
 /* Send one Data block. vcols is an array of columns, each itself a value array.
@@ -1228,25 +1374,35 @@ CAMLprim value chc_stub_async_send_block(value vh, value vnames, value vtypes, v
     chc_block_builder_init(&bb, storage);
     bb.n_rows = n_rows;
 
+    /* Nothing below allocates on the OCaml heap until every column has been
+     * sent: the builder holds String_val pointers into the name strings, and a
+     * minor collection moving one would leave the block writer reading freed
+     * memory. Errors come back as return codes for the same reason. */
     chc_err err = {0};
     int rc = CHC_OK;
     size_t built = 0;
-    for (; built < n_cols && rc == CHC_OK; built++) {
-        rc = build_column(&ic[built], Field(vtypes, built), Field(vcols, built), n_rows, &box->al, &err);
-        if (rc == CHC_OK) {
-            chc_block_builder_append(&bb, String_val(Field(vnames, built)), caml_string_length(Field(vnames, built)), ic[built].ty,
-                                     ic[built].append);
-        } else {
-            built++; /* this column allocated too — free it along with the rest */
+    for (; built < n_cols; built++) {
+        value vtype = Field(vtypes, built);
+        rc = chc_type_parse(String_val(vtype), caml_string_length(vtype), &box->al, &ic[built].ty, &err);
+        if (rc != CHC_OK) {
             break;
         }
+        rc = build_node(&ic[built].node, ic[built].ty, Field(vcols, built), n_rows, &err);
+        if (rc != CHC_OK) {
+            break;
+        }
+        value vname = Field(vnames, built);
+        chc_block_builder_append(&bb, String_val(vname), caml_string_length(vname), ic[built].ty, &ic[built].node.col);
     }
 
     if (rc == CHC_OK) {
         rc = chc_async_send_data(box->c, &bb, &err);
     }
 
-    for (size_t i = 0; i < built && i < n_cols; i++) {
+    /* Breaking out early leaves [built] indexing the column that failed, which
+     * allocated too; free through it. */
+    size_t touched = built < n_cols ? built + 1 : n_cols;
+    for (size_t i = 0; i < touched; i++) {
         ins_col_free(&ic[i], &box->al);
     }
     free(ic);

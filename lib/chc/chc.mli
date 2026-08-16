@@ -480,8 +480,16 @@ module Client : sig
       65536) rather than as one block, and the out buffer is flushed between
       batches — sends never block, so nothing else applies backpressure.
 
+      Composites nest to any depth, in the shapes {!column} produces: {!Arr}
+      for [Array], {!Tup} for [Tuple], and {!Arr} of two-element {!Tup} for
+      [Map]. [JSON], [Dynamic], [Variant], the geo types and
+      [AggregateFunction] state are not writable, and are refused rather than
+      mis-encoded.
+
+      @raise Invalid_argument on a value whose shape does not match its column
+      type, naming the column, the row and both sides.
       @raise Error on a server-side rejection, or on a column type the writer
-      does not support. See {!Async.send_block}. *)
+      does not support. *)
   val insert : ?columns:string list -> ?batch_size:int -> t -> string -> value array array -> unit
 
   val server_info : t -> Async.server_info

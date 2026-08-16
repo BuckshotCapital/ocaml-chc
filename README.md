@@ -103,9 +103,9 @@ every column after the insertion point.
 ## Types
 
 Numeric, string, date/time, `Nullable`, `Array`, `Tuple`, `Map` and
-`LowCardinality` (including `LowCardinality(Nullable(T))`) all decode. `Map`
-surfaces as an array of pairs, matching its physical `Array(Tuple(K, V))`
-layout.
+`LowCardinality` (including `LowCardinality(Nullable(T))`) all work in both
+directions, nested to any depth. `Map` surfaces as an array of pairs, matching
+its physical `Array(Tuple(K, V))` layout.
 
 Types wider than any OCaml integer render to exact text rather than being
 truncated:
@@ -216,8 +216,33 @@ instead of hiding it, since it is the cheapest way to learn a result's schema.
 ## Writing
 
 The write path covers fixed-width leaves, `String`, the wide types above,
-`LowCardinality` of either, and `Nullable` of any of them. `Array`, `Tuple` and
-`Map` decode but do not yet encode, and raise rather than silently mis-encoding.
+`Nullable` of any of them, and `Array`, `Tuple`, `Map` and `LowCardinality`
+nested to any depth — `Map(String, Array(Float64))` and
+`Array(LowCardinality(Nullable(String)))` both round-trip. Values take the same
+shapes decoding produces, so a row read back can be written straight out again:
+
+```ocaml
+Chc.Client.insert c "events" [|
+  [| Chc.Arr [| Chc.Str "a"; Chc.Str "b" |]                          (* Array(String) *)
+   ; Chc.Tup [| Chc.Uint 7L; Chc.Str "seven" |]                      (* Tuple(UInt8, String) *)
+   ; Chc.Arr [| Chc.Tup [| Chc.Str "k"; Chc.Uint 1L |] |]            (* Map(String, UInt32) *)
+  |];
+|]
+```
+
+A value whose shape does not match its column raises `Invalid_argument` naming
+the column, the row and both sides — `column "tags" row 3: Array(String)
+expects an array, got text` — before any of that block reaches the socket.
+`JSON`, `Dynamic`, `Variant`, the geo types and `AggregateFunction` state stay
+unwritable, and are refused rather than mis-encoded.
+
+Composites are flattened in OCaml, not in C: an `Array` becomes cumulative
+offsets plus its elements one level down, a `Tuple` transposes into one column
+per field, and a `Map` is an `Array` over a two-field `Tuple` — the physical
+layout the reader already exposes, run backwards. Each wants a growable buffer,
+a transpose or a hash table, so doing it on the OCaml side keeps the stub a
+layout copy. Offsets are per block, so a row past the 65536-row batch boundary
+is the case worth testing, and is.
 
 `LowCardinality` is the one column type that is not a straight serialisation —
 it needs a dictionary of distinct values, a per-row index into it, and a key
@@ -256,7 +281,7 @@ protocol violation later.
 3. ~~Insert path (`chc_block_builder`) and LZ4/ZSTD compression.~~ Done.
 4. ~~Wide types: 128/256-bit integers and decimals, `UUID`, `IPv4`/`IPv6` as
    first-class values, both directions.~~ Done.
-5. Composite writes: `Array`, `Tuple`, `Map`, `LowCardinality`.
+5. ~~Composite writes: `Array`, `Tuple`, `Map`, `LowCardinality`.~~ Done.
 6. Lwt / Eio drivers — replace `Chc.Client`'s pump, reuse everything else.
 
 ## Query parameters

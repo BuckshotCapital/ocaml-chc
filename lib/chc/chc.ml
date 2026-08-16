@@ -451,6 +451,22 @@ let rec string_of_value = function
 type block_handle
 type reader_handle
 
+(* A parsed ClickHouse type on its own, with no block behind it — [t_kind] is a
+   chc_kind ordinal, [t_name] the printable form, [t_elem] the fixed width in
+   bytes (0 for anything not fixed-width) and [t_scale] a Decimal's scale.
+
+   The write path walks this in step with the values it is handed, which is why
+   it needs the whole tree rather than a root: Array(LowCardinality(Nullable(
+   String))) decides the shape of three nested builders. Reading uses the
+   block's own type pointers instead — see [tynode]. *)
+type tdesc =
+  { t_kind : int
+  ; t_name : string
+  ; t_elem : int
+  ; t_scale : int
+  ; t_children : tdesc array
+  }
+
 (* Unix.file_descr is an int at runtime on Unix, so the stub reads it with
    Int_val — same convention the stdlib's own unix stubs use. *)
 external reader_open : Unix.file_descr -> bool -> bool -> int -> reader_handle = "chc_stub_reader_open"
@@ -468,7 +484,7 @@ external ty_kind : block_handle -> nativeint -> int = "chc_stub_type_kind"
 external ty_child : block_handle -> nativeint -> int -> nativeint = "chc_stub_type_child"
 external ty_format : block_handle -> nativeint -> string = "chc_stub_type_format"
 external ty_decimal_scale : block_handle -> nativeint -> int = "chc_stub_type_decimal_scale"
-external type_info_raw : string -> int * int * int = "chc_stub_type_info"
+external type_tree : string -> tdesc = "chc_stub_type_tree"
 external col_layout : block_handle -> nativeint -> int = "chc_stub_col_layout"
 external col_n_rows : block_handle -> nativeint -> int = "chc_stub_col_n_rows"
 external col_validate : block_handle -> nativeint -> unit = "chc_stub_col_validate"
@@ -1079,14 +1095,19 @@ module Async = struct
     -> handle
     = "chc_stub_async_create_bytecode" "chc_stub_async_create"
 
-  (* Mirrors the COL_PLAIN / COL_LC tags in chc_stubs.c. LowCardinality needs a
-     dictionary and per-row indices rather than a flat buffer, and building that
-     wants a hash table — which OCaml has and C does not. *)
-  type encoded_column =
-    | Plain of value array
-    | Lc of value array * int array
+  (* Mirrors the ENC_* tags in chc_stubs.c: a column already in wire shape.
+     Composites are flattened here rather than in C because all three want a
+     data structure C does not have — a growable buffer for an Array's
+     elements, a transpose for a Tuple, a hash table for a LowCardinality
+     dictionary (a linear scan would be quadratic in cardinality). What crosses
+     the boundary is then a layout copy. *)
+  type encoded =
+    | Enc_plain of value array
+    | Enc_lc of value array * int array
+    | Enc_array of int array * encoded (* cumulative exclusive ends, elements *)
+    | Enc_tuple of encoded array (* one column per field, each n_rows long *)
 
-  external send_block_raw : handle -> string array -> string array -> encoded_column array -> int -> unit = "chc_stub_async_send_block"
+  external send_block_raw : handle -> string array -> string array -> encoded array -> int -> unit = "chc_stub_async_send_block"
   external close_raw : handle -> unit = "chc_stub_async_close"
   external handshake_raw : handle -> bool = "chc_stub_async_handshake"
   external send_query_raw : handle -> string -> string -> unit = "chc_stub_async_send_query"
@@ -1183,21 +1204,25 @@ module Async = struct
     | n -> invalid_arg (Printf.sprintf "Chc.Async.compression: unknown value %d" n)
   ;;
 
+  let tkind ty = Kind.of_int ty.t_kind
+
+  (* chc_type_parse pins the arity of every composite the server can legitimately
+     send, so this only fires on a type that arrives childless — but an error
+     naming it beats Index_out_of_bounds from the middle of a walk. *)
+  let child ty i =
+    if i < Array.length ty.t_children then ty.t_children.(i) else invalid_arg (Printf.sprintf "Chc: %s has no child %d" ty.t_name i)
+  ;;
+
   (* The C encoder writes fixed-width cells straight from Int/Uint/Float/Raw.
      The wide types arrive as text, so they are turned into wire bytes here —
      in OCaml, where the parsing is memory-safe and testable, rather than in the
      stub. Columns of any other type are passed through untouched. *)
-  let normalize_wide type_name cells =
-    let bare =
-      let p = "Nullable(" in
-      let n = String.length type_name in
-      if n > String.length p && String.sub type_name 0 (String.length p) = p && type_name.[n - 1] = ')'
-      then String.sub type_name (String.length p) (n - String.length p - 1)
-      else type_name
-    in
-    let kind_ordinal, elem, scale = type_info_raw bare in
+  let normalize_wide ty cells =
+    let leaf = if tkind ty = Kind.Nullable then child ty 0 else ty in
+    let elem = leaf.t_elem
+    and scale = leaf.t_scale in
     let convert =
-      match Kind.of_int kind_ordinal with
+      match tkind leaf with
       | Kind.UUID ->
         Some
           (function
@@ -1262,27 +1287,91 @@ module Async = struct
     Array.of_list (List.rev !dict), keys
   ;;
 
-  let lc_inner type_name =
-    let p = "LowCardinality(" in
-    let n = String.length type_name in
-    if n > String.length p && String.sub type_name 0 (String.length p) = p && type_name.[n - 1] = ')'
-    then Some (String.sub type_name (String.length p) (n - String.length p - 1))
-    else None
+  let shape_of = function
+    | Null -> "NULL"
+    | Bool _ -> "a boolean"
+    | Int _ | Uint _ -> "an integer"
+    | Float _ -> "a float"
+    | Str _ -> "text"
+    | Raw _ -> "raw bytes"
+    | Big _ -> "a wide integer"
+    | Decimal _ -> "a decimal"
+    | Uuid _ -> "a UUID"
+    | Ip _ -> "an IP address"
+    | Arr _ -> "an array"
+    | Tup _ -> "a tuple"
+  ;;
+
+  (* Name the column, the row and both sides. An INSERT that fails on row 40000
+     of a batch is unhelpful without them, and the C builder is past the point
+     where it still knows any of the three. *)
+  let bad_shape ~column ty row want v =
+    invalid_arg (Printf.sprintf "Chc: column %S row %d: %s expects %s, got %s" column row ty.t_name want (shape_of v))
+  ;;
+
+  (* Cumulative exclusive ends plus the concatenated elements: the array layout
+     on the wire, and the inverse of what the decoder slices apart. *)
+  let flatten ~column ty cells =
+    let offsets = Array.make (Array.length cells) 0 in
+    let total = ref 0 in
+    Array.iteri
+      (fun i v ->
+         (match v with
+          | Arr a -> total := !total + Array.length a
+          | v -> bad_shape ~column ty i "an array" v);
+         offsets.(i) <- !total)
+      cells;
+    let flat = Array.make !total Null in
+    let at = ref 0 in
+    Array.iter
+      (function
+        | Arr a ->
+          Array.blit a 0 flat !at (Array.length a);
+          at := !at + Array.length a
+        | _ -> ())
+      cells;
+    offsets, flat
+  ;;
+
+  (* Transpose: the wire wants one column per tuple field, the caller supplies
+     one tuple per row. *)
+  let tuple_field ~column ty arity i cells =
+    Array.mapi
+      (fun r v ->
+         match v with
+         | Tup a when Array.length a = arity -> a.(i)
+         | Tup a ->
+           invalid_arg (Printf.sprintf "Chc: column %S row %d: %s has %d fields, got a %d-tuple" column r ty.t_name arity (Array.length a))
+         | v -> bad_shape ~column ty r "a tuple" v)
+      cells
+  ;;
+
+  (* Walk the type and the values together, one level per composite. *)
+  let rec encode ~column ty cells =
+    match tkind ty with
+    | Kind.Array ->
+      let offsets, elements = flatten ~column ty cells in
+      Enc_array (offsets, encode ~column (child ty 0) elements)
+    | Kind.Map ->
+      (* Physically Array(Tuple(K, V)), which is how the decoder surfaces it —
+         each entry a two-element Tup. This reads that shape back. *)
+      let offsets, entries = flatten ~column ty cells in
+      let keys = encode ~column (child ty 0) (tuple_field ~column ty 2 0 entries) in
+      let vals = encode ~column (child ty 1) (tuple_field ~column ty 2 1 entries) in
+      Enc_array (offsets, Enc_tuple [| keys; vals |])
+    | Kind.Tuple ->
+      let arity = Array.length ty.t_children in
+      Enc_tuple (Array.init arity (fun i -> encode ~column (child ty i) (tuple_field ~column ty arity i cells)))
+    | Kind.LowCardinality ->
+      let inner = child ty 0 in
+      let dict, keys = dictionary_encode ~nullable_inner:(tkind inner = Kind.Nullable) (normalize_wide inner cells) in
+      Enc_lc (dict, keys)
+    | _ -> Enc_plain (normalize_wide ty cells)
   ;;
 
   let send_block t ~names ~types ~columns ~n_rows =
     check t;
-    let encoded =
-      Array.mapi
-        (fun c cells ->
-           match lc_inner types.(c) with
-           | Some inner ->
-             let nullable_inner = String.length inner >= 9 && String.sub inner 0 9 = "Nullable(" in
-             let dict, keys = dictionary_encode ~nullable_inner (normalize_wide inner cells) in
-             Lc (dict, keys)
-           | None -> Plain (normalize_wide types.(c) cells))
-        columns
-    in
+    let encoded = Array.mapi (fun c cells -> encode ~column:names.(c) (type_tree types.(c)) cells) columns in
     send_block_raw t.h names types encoded n_rows
   ;;
 end
