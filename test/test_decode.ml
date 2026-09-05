@@ -136,6 +136,31 @@ let () =
   print_endline "low cardinality nullable";
   let _, _, d = read_all "SELECT toLowCardinality(if(number = 1, NULL, 'v')) AS lc FROM numbers(3)" in
   check_eq "lc nullable" ~expected:"v,NULL,v" ~actual:(String.concat "," (Array.to_list (Array.map show (col_all d 0))));
+  print_endline "interval";
+  (* Needs the block itself, not just its values: the unit lives on the type. *)
+  let fd, cleanup = native_fd "SELECT INTERVAL 3 DAY AS d, toIntervalMillisecond(1500) AS ms, toInt64(1) AS i" in
+  let r = Chc.open_fd fd in
+  let unit_name b i =
+    match Chc.column_interval_unit b i with
+    | Some u -> Chc.Interval_unit.to_string u
+    | None -> "none"
+  in
+  let seen = ref false in
+  Chc.fold r ~init:() ~f:(fun () b ->
+    if Chc.n_rows b > 0 && not !seen
+    then (
+      seen := true;
+      check_eq "day type" ~expected:"IntervalDay" ~actual:(Chc.column_type_name b 0);
+      check_eq "millisecond type" ~expected:"IntervalMillisecond" ~actual:(Chc.column_type_name b 1);
+      check "both are Kind.Interval" (Chc.column_kind b 0 = Chc.Kind.Interval && Chc.column_kind b 1 = Chc.Kind.Interval);
+      check_eq "day unit" ~expected:"Day" ~actual:(unit_name b 0);
+      check_eq "millisecond unit" ~expected:"Millisecond" ~actual:(unit_name b 1);
+      check_eq "Int64 has no unit" ~expected:"none" ~actual:(unit_name b 2);
+      check_eq "day value" ~expected:"3" ~actual:(show (Chc.column b 0).(0));
+      check_eq "millisecond value" ~expected:"1500" ~actual:(show (Chc.column b 1).(0))));
+  check "interval block seen" !seen;
+  Chc.close r;
+  cleanup ();
   Printf.printf "ip backend: %s\n" Chc.ip_backend;
   check "ip backend is one of the two" (Chc.ip_backend = "ipaddr" || Chc.ip_backend = "builtin");
   print_endline "wide types render as ClickHouse does";

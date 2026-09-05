@@ -64,6 +64,33 @@ let run () =
   let si = Chc_async.server_info conn in
   check "server name non-empty" (not (String.is_empty si.Chc.Protocol.server_name));
   check "revision negotiated" (si.Chc.Protocol.revision > 0);
+  print_endline "handshake rejection";
+  let%bind rejected =
+    Monitor.try_with ~run:`Now (fun () ->
+      Chc_async.connect
+        ~port:(Int.of_string (env "CHC_TEST_PORT" "9000"))
+        ~user:(env "CHC_TEST_USER" "default")
+        ~password:(env "CHC_TEST_PASSWORD" "")
+        ~database:"no such database"
+        (env "CHC_TEST_HOST" "127.0.0.1"))
+  in
+  let%bind () =
+    match rejected with
+    | Ok c ->
+      incr failures;
+      print_endline "  FAIL unknown database did not raise";
+      Chc_async.close c
+    | Error exn ->
+      (match Monitor.extract_exn exn with
+       | Chc.Error e ->
+         check "raises Chc.Error into the monitor" true;
+         check "carries server_code" (e.Chc.Error.server_code <> 0);
+         check "carries the server's text" (String.is_substring e.Chc.Error.msg ~substring:"no such database")
+       | other ->
+         incr failures;
+         printf "  FAIL unexpected exception %s\n" (Exn.to_string other));
+      return ()
+  in
   print_endline "scalars";
   let%bind v = one conn "SELECT toInt32(-5)" in
   check_eq "int" ~expected:"-5" ~actual:v;

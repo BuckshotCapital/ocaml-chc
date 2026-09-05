@@ -208,6 +208,53 @@ module Kind = struct
   ;;
 end
 
+module Interval_unit = struct
+  type t =
+    | Nanosecond
+    | Microsecond
+    | Millisecond
+    | Second
+    | Minute
+    | Hour
+    | Day
+    | Week
+    | Month
+    | Quarter
+    | Year
+
+  (* chc_interval_unit: 0 is CHC_INTERVAL_NONE, what every non-Interval type
+     reports; the units follow in ClickHouse's IntervalKind order. *)
+  let of_int = function
+    | 0 -> None
+    | 1 -> Some Nanosecond
+    | 2 -> Some Microsecond
+    | 3 -> Some Millisecond
+    | 4 -> Some Second
+    | 5 -> Some Minute
+    | 6 -> Some Hour
+    | 7 -> Some Day
+    | 8 -> Some Week
+    | 9 -> Some Month
+    | 10 -> Some Quarter
+    | 11 -> Some Year
+    | i -> invalid_arg (Printf.sprintf "Chc.Interval_unit.of_int: %d out of range" i)
+  ;;
+
+  let to_string = function
+    | Nanosecond -> "Nanosecond"
+    | Microsecond -> "Microsecond"
+    | Millisecond -> "Millisecond"
+    | Second -> "Second"
+    | Minute -> "Minute"
+    | Hour -> "Hour"
+    | Day -> "Day"
+    | Week -> "Week"
+    | Month -> "Month"
+    | Quarter -> "Quarter"
+    | Year -> "Year"
+  ;;
+end
+
 module Layout = struct
   type t =
     | Fixed
@@ -484,6 +531,7 @@ external ty_kind : block_handle -> nativeint -> int = "chc_stub_type_kind"
 external ty_child : block_handle -> nativeint -> int -> nativeint = "chc_stub_type_child"
 external ty_format : block_handle -> nativeint -> string = "chc_stub_type_format"
 external ty_decimal_scale : block_handle -> nativeint -> int = "chc_stub_type_decimal_scale"
+external ty_interval_unit : block_handle -> nativeint -> int = "chc_stub_type_interval_unit"
 external type_tree : string -> tdesc = "chc_stub_type_tree"
 external col_layout : block_handle -> nativeint -> int = "chc_stub_col_layout"
 external col_n_rows : block_handle -> nativeint -> int = "chc_stub_col_n_rows"
@@ -534,6 +582,8 @@ let decode_fixed (kind : Kind.t) ~scale (data : string) (elem : int) (n : int) :
   | Kind.DateTime64 -> Array.init n (fun i -> Int (i64 i))
   | Kind.Time -> Array.init n (fun i -> Int (i32 i))
   | Kind.Time64 -> Array.init n (fun i -> Int (i64 i))
+  (* Int64 ticks of the type's unit; column_interval_unit says which. *)
+  | Kind.Interval -> Array.init n (fun i -> Int (i64 i))
   | Kind.Enum8 -> Array.init n (fun i -> Int (Int64.of_int (String.get_int8 data (off i))))
   | Kind.Enum16 -> Array.init n (fun i -> Int (Int64.of_int (String.get_int16_le data (off i))))
   | Kind.FixedString -> Array.init n (fun i -> Str (slice i))
@@ -648,6 +698,7 @@ let n_columns = blk_n_columns
 let column_name = blk_column_name
 let column_type_name b i = ty_format b (blk_type_ptr b i)
 let column_kind b i = Kind.of_int (ty_kind b (blk_type_ptr b i))
+let column_interval_unit b i = Interval_unit.of_int (ty_interval_unit b (blk_type_ptr b i))
 
 (* The TCP path opens a query response with a schema-only block: column names
    and types are present, n_rows is 0, and clickhouse-c allocates no column

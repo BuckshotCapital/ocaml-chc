@@ -86,6 +86,24 @@ module Kind : sig
   val to_string : t -> string
 end
 
+module Interval_unit : sig
+  (** Unit of an [Interval*] column, mirroring [chc_interval_unit] in ClickHouse's [IntervalKind] order. *)
+  type t =
+    | Nanosecond
+    | Microsecond
+    | Millisecond
+    | Second
+    | Minute
+    | Hour
+    | Day
+    | Week
+    | Month
+    | Quarter
+    | Year
+
+  val to_string : t -> string
+end
+
 module Layout : sig
   (** Physical column layout, mirroring [chc_col_kind]. Several {!Kind.t}s share one layout — [Map] arrives as [Array] over a [Tuple]. *)
   type t =
@@ -113,7 +131,7 @@ end
 type value =
   | Null
   | Bool of bool
-  | Int of int64 (** signed integers, and scaled time mantissas *)
+  | Int of int64 (** signed integers, scaled time mantissas, and interval ticks *)
   | Uint of int64 (** unsigned; reinterpret via [Int64.unsigned_*] *)
   | Float of float
   | Str of string
@@ -144,6 +162,10 @@ val column_name : block -> int -> string
 val column_type_name : block -> int -> string
 
 val column_kind : block -> int -> Kind.t
+
+(** [Some unit] for an [Interval*] column. Every one of them reports {!Kind.Interval} and decodes as {!Int} ticks, so this is
+    what tells [IntervalDay] from [IntervalMillisecond]. [None] for any other type. *)
+val column_interval_unit : block -> int -> Interval_unit.t option
 
 (** @raise Invalid_argument on a schema-only block, which has no column tree. See {!column}. *)
 val column_layout : block -> int -> Layout.t
@@ -445,7 +467,8 @@ module Client : sig
       handshake. TLS is not handled here: terminate it in OCaml and drive
       {!Protocol} directly.
 
-      @raise Error on handshake or authentication failure. *)
+      @raise Error on handshake or authentication failure. When it is the server that refuses — bad credentials, unknown
+        database — [server_code] and [server_name] carry its exception and [msg] its full display text. *)
   val connect
     :  ?port:int
     -> ?database:string

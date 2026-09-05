@@ -68,6 +68,12 @@
 #  define CHC_REPRODUCIBLE
 #endif
 
+#if CHC__HAS_ATTR(fallthrough)
+#  define CHC_FALLTHROUGH [[fallthrough]]
+#else
+#  define CHC_FALLTHROUGH
+#endif
+
 /* ckd_mul (C23 <stdckdint.h>) backs chc__mul_size; see CHC__HAVE_CKD_MUL. */
 #if defined(__has_include)
 #  if __has_include(<stdckdint.h>)
@@ -102,16 +108,11 @@ enum {
 #endif
 
 typedef struct chc_err {
-    int  server_code;
     char msg[CHC_ERR_MSG_LEN];
-    char server_name[64];
 } chc_err;
 
 static inline void chc_err_reset(chc_err *e) {
-    if (!e) return;
-    e->server_code = 0;
-    e->msg[0] = '\0';
-    e->server_name[0] = '\0';
+    if (e) e->msg[0] = '\0';
 }
 
 /* -------------------------------------------------------------------------- */
@@ -189,6 +190,22 @@ typedef enum chc_kind {
     CHC_KIND_COUNT
 } chc_kind;
 
+/* Interval unit, ordered as ClickHouse IntervalKind */
+typedef enum chc_interval_unit {
+    CHC_INTERVAL_NONE = 0,
+    CHC_INTERVAL_NANOSECOND,
+    CHC_INTERVAL_MICROSECOND,
+    CHC_INTERVAL_MILLISECOND,
+    CHC_INTERVAL_SECOND,
+    CHC_INTERVAL_MINUTE,
+    CHC_INTERVAL_HOUR,
+    CHC_INTERVAL_DAY,
+    CHC_INTERVAL_WEEK,
+    CHC_INTERVAL_MONTH,
+    CHC_INTERVAL_QUARTER,
+    CHC_INTERVAL_YEAR,
+} chc_interval_unit;
+
 typedef struct chc_type chc_type;
 
 CHC_NODISCARD int  chc_type_parse(const char *name, size_t name_len,
@@ -204,6 +221,9 @@ size_t       chc_type_elem_size(const chc_type *t);
 int          chc_type_decimal_precision(const chc_type *t);
 int          chc_type_decimal_scale(const chc_type *t);
 int          chc_type_datetime64_scale(const chc_type *t);
+
+/* Values arrive as Int64 ticks of unit. */
+chc_interval_unit chc_type_interval_unit(const chc_type *t);
 
 /* QBit(T, N): N (vector dimension). 0 on non-QBit types. The element type
  * (BFloat16/Float32/Float64) is children[0], reached via chc_type_child(t, 0). */
@@ -466,7 +486,7 @@ static inline uint64_t chc__bswap64(uint64_t v) {
 
 /* Frozen v1.0.3 variant of CityHash, ported from city.cc.
  * Original: Copyright (c) 2011 Google, Inc. (MIT licence).
- * Short-string path lives here so chc__name_to_kind can reuse it; 128-bit
+ * Short-string path lives here so chc__name_lookup can reuse it; 128-bit
  * compressed-frame checksum driver in clickhouse-compression.h builds on
  * these helpers */
 
@@ -1007,6 +1027,7 @@ struct chc_type {
         struct { int precision, scale; }               decimal;       /* Decimal(P, S) */
         struct { int scale; char *tz; size_t tz_len; } temporal;      /* DateTime / DateTime64 / Time64 */
         struct { size_t dimension; }                   qbit;          /* QBit(T, N): N; element type in children[0] */
+        chc_interval_unit                              interval;      /* IntervalNanosecond .. IntervalYear */
         struct {
             size_t n;
             struct { char *name; uint32_t name_len; int16_t value; } *items;
@@ -1052,6 +1073,7 @@ const chc_type  *chc_type_child(const chc_type *t, size_t i)    { return (t && i
 int              chc_type_fixed_size(const chc_type *t)         { return t && t->kind == CHC_FIXED_STRING ? t->fixed_string.n : 0; }
 int              chc_type_decimal_scale(const chc_type *t)      { return (t && chc__kind_is_decimal(t->kind)) ? t->decimal.scale : 0; }
 int              chc_type_datetime64_scale(const chc_type *t)   { return (t && (t->kind == CHC_DATETIME64 || t->kind == CHC_TIME64)) ? t->temporal.scale : 0; }
+chc_interval_unit chc_type_interval_unit(const chc_type *t)     { return (t && t->kind == CHC_INTERVAL) ? t->interval : CHC_INTERVAL_NONE; }
 size_t           chc_type_qbit_dimension(const chc_type *t)     { return (t && t->kind == CHC_QBIT) ? t->qbit.dimension : 0; }
 size_t           chc_type_qbit_element_size(const chc_type *t)  { return (t && t->kind == CHC_QBIT && t->n_children == 1) ? chc_type_elem_size(t->children[0]) * 8 : 0; }
 const char      *chc_type_name(const chc_type *t, size_t *out_len) {
@@ -1234,92 +1256,113 @@ chc__atoi64(const char *s, size_t n, int64_t *out)
 /* AUTO-GENERATED-NAME-TABLE-BEGIN -- regenerate via tools/regen_name_table.sh */
 #define CHC__NAME_TABLE_M 256u
 #define CHC__NAME_TABLE_SEED 5935ull
-struct chc__name_row { const char *name; chc_kind kind; };
-static const struct chc__name_row chc__name_table[CHC__NAME_TABLE_M] = {
-    [  2] = {"Ring", CHC_RING},
-    [  6] = {"Tuple", CHC_TUPLE},
-    [  9] = {"IntervalHour", CHC_INTERVAL},
-    [ 27] = {"UInt8", CHC_UINT8},
-    [ 29] = {"Nothing", CHC_NOTHING},
-    [ 36] = {"Object", CHC_OBJECT},
-    [ 39] = {"Void", CHC_VOID},
-    [ 42] = {"IntervalYear", CHC_INTERVAL},
-    [ 45] = {"Nullable", CHC_NULLABLE},
-    [ 51] = {"Enum8", CHC_ENUM8},
-    [ 52] = {"LineString", CHC_LINE_STRING},
-    [ 59] = {"Bool", CHC_BOOL},
-    [ 67] = {"FixedString", CHC_FIXED_STRING},
-    [ 68] = {"Enum16", CHC_ENUM16},
-    [ 71] = {"Int16", CHC_INT16},
-    [ 72] = {"IntervalDay", CHC_INTERVAL},
-    [ 73] = {"UUID", CHC_UUID},
-    [ 80] = {"AggregateFunction", CHC_AGGREGATE_FUNCTION},
-    [ 81] = {"DateTime64", CHC_DATETIME64},
-    [ 85] = {"MultiPolygon", CHC_MULTI_POLYGON},
-    [ 86] = {"IntervalQuarter", CHC_INTERVAL},
-    [ 97] = {"Decimal64", CHC_DECIMAL64},
-    [ 98] = {"Array", CHC_ARRAY},
-    [107] = {"Time64", CHC_TIME64},
-    [109] = {"LowCardinality", CHC_LOW_CARDINALITY},
-    [111] = {"QBit", CHC_QBIT},
-    [112] = {"IntervalNanosecond", CHC_INTERVAL},
-    [113] = {"Int64", CHC_INT64},
-    [118] = {"UInt32", CHC_UINT32},
-    [123] = {"IntervalMillisecond", CHC_INTERVAL},
-    [126] = {"MultiLineString", CHC_MULTI_LINE_STRING},
-    [127] = {"UInt128", CHC_UINT128},
-    [129] = {"DateTime", CHC_DATETIME},
-    [133] = {"IntervalMinute", CHC_INTERVAL},
-    [134] = {"Date", CHC_DATE},
-    [137] = {"IntervalSecond", CHC_INTERVAL},
-    [138] = {"String", CHC_STRING},
-    [139] = {"Date32", CHC_DATE32},
-    [141] = {"IPv6", CHC_IPV6},
-    [142] = {"Point", CHC_POINT},
-    [151] = {"IntervalMonth", CHC_INTERVAL},
-    [153] = {"Time", CHC_TIME},
-    [154] = {"Float32", CHC_FLOAT32},
-    [159] = {"Int8", CHC_INT8},
-    [160] = {"BFloat16", CHC_BFLOAT16},
-    [168] = {"Variant", CHC_VARIANT},
-    [170] = {"Decimal256", CHC_DECIMAL256},
-    [173] = {"SimpleAggregateFunction", CHC_SIMPLE_AGGREGATE_FUNCTION},
-    [174] = {"Map", CHC_MAP},
-    [175] = {"Decimal32", CHC_DECIMAL32},
-    [176] = {"IntervalWeek", CHC_INTERVAL},
-    [180] = {"JSON", CHC_JSON},
-    [192] = {"Float64", CHC_FLOAT64},
-    [202] = {"Int128", CHC_INT128},
-    [204] = {"Int256", CHC_INT256},
-    [205] = {"Nested", CHC_NESTED},
-    [206] = {"Int32", CHC_INT32},
-    [215] = {"Polygon", CHC_POLYGON},
-    [223] = {"UInt256", CHC_UINT256},
-    [226] = {"UInt16", CHC_UINT16},
-    [238] = {"UInt64", CHC_UINT64},
-    [240] = {"IntervalMicrosecond", CHC_INTERVAL},
-    [247] = {"IPv4", CHC_IPV4},
-    [251] = {"Dynamic", CHC_DYNAMIC},
-    [252] = {"Decimal128", CHC_DECIMAL128},
+#define CHC__NAME_TABLE_MAXLEN 23u
+struct chc__name_row { uint16_t off; uint8_t len; uint8_t kind; uint8_t unit; };
+static const char chc__name_blob[] =
+    "SimpleAggregateFunctionIntervalMicrosecondIntervalMillisecondInt"
+    "ervalNanosecondMultiLineStringIntervalQuarterLowCardinalityInter"
+    "valSecondIntervalMinuteIntervalMonthMultiPolygonIntervalHourInte"
+    "rvalWeekIntervalYearFixedStringIntervalDayDateTime64Decimal128De"
+    "cimal256Decimal32Decimal64BFloat16NullableUInt128UInt256Float32F"
+    "loat64NothingVariantDynamicUInt16UInt32UInt64Date32Enum16NestedO"
+    "bjectUInt8Enum8ArrayTuplePointBoolUUIDIPv4IPv6VoidRingJSONQBitMa"
+    "p";
+static const struct chc__name_row chc__name_rows[] = {
+    {390,  4, CHC_INT8, CHC_INTERVAL_NONE},
+    {348,  5, CHC_INT16, CHC_INTERVAL_NONE},
+    {354,  5, CHC_INT32, CHC_INTERVAL_NONE},
+    {360,  5, CHC_INT64, CHC_INTERVAL_NONE},
+    {299,  6, CHC_INT128, CHC_INTERVAL_NONE},
+    {306,  6, CHC_INT256, CHC_INTERVAL_NONE},
+    {389,  5, CHC_UINT8, CHC_INTERVAL_NONE},
+    {347,  6, CHC_UINT16, CHC_INTERVAL_NONE},
+    {353,  6, CHC_UINT32, CHC_INTERVAL_NONE},
+    {359,  6, CHC_UINT64, CHC_INTERVAL_NONE},
+    {298,  7, CHC_UINT128, CHC_INTERVAL_NONE},
+    {305,  7, CHC_UINT256, CHC_INTERVAL_NONE},
+    {312,  7, CHC_FLOAT32, CHC_INTERVAL_NONE},
+    {319,  7, CHC_FLOAT64, CHC_INTERVAL_NONE},
+    {282,  8, CHC_BFLOAT16, CHC_INTERVAL_NONE},
+    {414,  4, CHC_BOOL, CHC_INTERVAL_NONE},
+    { 88,  6, CHC_STRING, CHC_INTERVAL_NONE},
+    {212, 11, CHC_FIXED_STRING, CHC_INTERVAL_NONE},
+    {234,  4, CHC_DATE, CHC_INTERVAL_NONE},
+    {365,  6, CHC_DATE32, CHC_INTERVAL_NONE},
+    {234,  8, CHC_DATETIME, CHC_INTERVAL_NONE},
+    {234, 10, CHC_DATETIME64, CHC_INTERVAL_NONE},
+    {238,  4, CHC_TIME, CHC_INTERVAL_NONE},
+    {238,  6, CHC_TIME64, CHC_INTERVAL_NONE},
+    {418,  4, CHC_UUID, CHC_INTERVAL_NONE},
+    {422,  4, CHC_IPV4, CHC_INTERVAL_NONE},
+    {426,  4, CHC_IPV6, CHC_INTERVAL_NONE},
+    {394,  5, CHC_ENUM8, CHC_INTERVAL_NONE},
+    {371,  6, CHC_ENUM16, CHC_INTERVAL_NONE},
+    {264,  9, CHC_DECIMAL32, CHC_INTERVAL_NONE},
+    {273,  9, CHC_DECIMAL64, CHC_INTERVAL_NONE},
+    {244, 10, CHC_DECIMAL128, CHC_INTERVAL_NONE},
+    {254, 10, CHC_DECIMAL256, CHC_INTERVAL_NONE},
+    {290,  8, CHC_NULLABLE, CHC_INTERVAL_NONE},
+    {399,  5, CHC_ARRAY, CHC_INTERVAL_NONE},
+    {404,  5, CHC_TUPLE, CHC_INTERVAL_NONE},
+    {446,  3, CHC_MAP, CHC_INTERVAL_NONE},
+    {377,  6, CHC_NESTED, CHC_INTERVAL_NONE},
+    {109, 14, CHC_LOW_CARDINALITY, CHC_INTERVAL_NONE},
+    {326,  7, CHC_NOTHING, CHC_INTERVAL_NONE},
+    {430,  4, CHC_VOID, CHC_INTERVAL_NONE},
+    {409,  5, CHC_POINT, CHC_INTERVAL_NONE},
+    {434,  4, CHC_RING, CHC_INTERVAL_NONE},
+    {169,  7, CHC_POLYGON, CHC_INTERVAL_NONE},
+    {164, 12, CHC_MULTI_POLYGON, CHC_INTERVAL_NONE},
+    { 84, 10, CHC_LINE_STRING, CHC_INTERVAL_NONE},
+    { 79, 15, CHC_MULTI_LINE_STRING, CHC_INTERVAL_NONE},
+    {  0, 23, CHC_SIMPLE_AGGREGATE_FUNCTION, CHC_INTERVAL_NONE},
+    {  6, 17, CHC_AGGREGATE_FUNCTION, CHC_INTERVAL_NONE},
+    {333,  7, CHC_VARIANT, CHC_INTERVAL_NONE},
+    {340,  7, CHC_DYNAMIC, CHC_INTERVAL_NONE},
+    {438,  4, CHC_JSON, CHC_INTERVAL_NONE},
+    {383,  6, CHC_OBJECT, CHC_INTERVAL_NONE},
+    {442,  4, CHC_QBIT, CHC_INTERVAL_NONE},
+    { 61, 18, CHC_INTERVAL, CHC_INTERVAL_NANOSECOND},
+    { 23, 19, CHC_INTERVAL, CHC_INTERVAL_MICROSECOND},
+    { 42, 19, CHC_INTERVAL, CHC_INTERVAL_MILLISECOND},
+    {123, 14, CHC_INTERVAL, CHC_INTERVAL_SECOND},
+    {137, 14, CHC_INTERVAL, CHC_INTERVAL_MINUTE},
+    {176, 12, CHC_INTERVAL, CHC_INTERVAL_HOUR},
+    {223, 11, CHC_INTERVAL, CHC_INTERVAL_DAY},
+    {188, 12, CHC_INTERVAL, CHC_INTERVAL_WEEK},
+    {151, 13, CHC_INTERVAL, CHC_INTERVAL_MONTH},
+    { 94, 15, CHC_INTERVAL, CHC_INTERVAL_QUARTER},
+    {200, 12, CHC_INTERVAL, CHC_INTERVAL_YEAR},
+};
+static const uint8_t chc__name_slot[CHC__NAME_TABLE_M] = {
+    [  2] = 43, [  6] = 36, [  9] = 60, [ 27] =  7, [ 29] = 40, [ 36] = 53,
+    [ 39] = 41, [ 42] = 65, [ 45] = 34, [ 51] = 28, [ 52] = 46, [ 59] = 16,
+    [ 67] = 18, [ 68] = 29, [ 71] =  2, [ 72] = 61, [ 73] = 25, [ 80] = 49,
+    [ 81] = 22, [ 85] = 45, [ 86] = 64, [ 97] = 31, [ 98] = 35, [107] = 24,
+    [109] = 39, [111] = 54, [112] = 55, [113] =  4, [118] =  9, [123] = 57,
+    [126] = 47, [127] = 11, [129] = 21, [133] = 59, [134] = 19, [137] = 58,
+    [138] = 17, [139] = 20, [141] = 27, [142] = 42, [151] = 63, [153] = 23,
+    [154] = 13, [159] =  1, [160] = 15, [168] = 50, [170] = 33, [173] = 48,
+    [174] = 37, [175] = 30, [176] = 62, [180] = 52, [192] = 14, [202] =  5,
+    [204] =  6, [205] = 38, [206] =  3, [215] = 44, [223] = 12, [226] =  8,
+    [238] = 10, [240] = 56, [247] = 26, [251] = 51, [252] = 32,
 };
 /* AUTO-GENERATED-NAME-TABLE-END */
 
 /* Plain "Decimal" is intentionally absent from the table; the parser's
- * decimal_alias branch resolves it from precision. Miss -> CHC_VOID, also
- * the sentinel for unknown names; caller disambiguates with an explicit
- * memcmp against "Void". */
-static chc_kind
-chc__name_to_kind(const char *s, size_t n) CHC_REPRODUCIBLE
+ * decimal_alias branch resolves it from precision. */
+static const struct chc__name_row *
+chc__name_lookup(const char *s, size_t n) CHC_REPRODUCIBLE
 {
-    if (n == 0 || n > 23) return CHC_VOID;
+    if (n == 0 || n > CHC__NAME_TABLE_MAXLEN) return NULL;
     size_t h_len = n < 16 ? n : 16;
     uint64_t h = chc__city_hash_len_16(
         chc__city_hash_len_0_to_16(s, h_len) + (uint64_t) n,
         CHC__NAME_TABLE_SEED);
-    const struct chc__name_row *r = &chc__name_table[h & (CHC__NAME_TABLE_M - 1)];
-    if (r->name && strlen(r->name) == n && memcmp(r->name, s, n) == 0)
-        return r->kind;
-    return CHC_VOID;
+    uint8_t i = chc__name_slot[h & (CHC__NAME_TABLE_M - 1)];
+    if (!i) return NULL;
+    const struct chc__name_row *r = &chc__name_rows[i - 1];
+    return (r->len == n && memcmp(chc__name_blob + r->off, s, n) == 0) ? r : NULL;
 }
 
 static int chc__parse_type(chc__lex *lx, const chc_alloc *al,
@@ -1380,16 +1423,22 @@ chc__parse_type(chc__lex *lx, const chc_alloc *al,
     if (decimal_alias) {
         t->kind = CHC_DECIMAL128;       /* placeholder; refined from precision */
     } else {
-        t->kind = chc__name_to_kind(head.start, head.len);
-        if (t->kind == CHC_VOID && !(head.len == 4 && memcmp(head.start, "Void", 4) == 0)) {
+        const struct chc__name_row *row = chc__name_lookup(head.start, head.len);
+        if (!row) {
             chc_type_destroy(t, al);
             return chc__err_set(err, CHC_ERR_TYPE, "unknown type: %.*s",
                                 (int) head.len, head.start);
         }
+        t->kind = (chc_kind) row->kind;
+        if (t->kind == CHC_INTERVAL) t->interval = (chc_interval_unit) row->unit;
     }
 
     const char *name_start = head.start;
     const char *name_end   = head.start + head.len;
+
+    /* ClickHouse defaults to milliseconds. */
+    if (t->kind == CHC_DATETIME64 || t->kind == CHC_TIME64)
+        t->temporal.scale = 3;
 
     /* Optional parameter list. */
     if (chc__peek_tok(lx).kind == CHC__TOK_LPAREN) {
@@ -1489,20 +1538,22 @@ chc__parse_type(chc__lex *lx, const chc_alloc *al,
             }
             t->decimal.scale = (int) scale;
         } else if (t->kind == CHC_DATETIME64 || t->kind == CHC_TIME64) {
-            chc__tok num = chc__eat_tok(lx);
-            if (num.kind != CHC__TOK_NUMBER) {
-                chc_type_destroy(t, al);
-                return chc__err_set(err, CHC_ERR_TYPE, "DateTime64: expected precision");
+            if (chc__peek_tok(lx).kind != CHC__TOK_RPAREN) {
+                chc__tok num = chc__eat_tok(lx);
+                if (num.kind != CHC__TOK_NUMBER) {
+                    chc_type_destroy(t, al);
+                    return chc__err_set(err, CHC_ERR_TYPE, "DateTime64: expected precision");
+                }
+                int64_t scale;
+                if (!chc__atoi64(num.start, num.len, &scale)
+                    || scale < 0 || scale > 9) {
+                    chc_type_destroy(t, al);
+                    return chc__err_set(err, CHC_ERR_TYPE,
+                        "DateTime64: precision out of range: %.*s",
+                        (int) num.len, num.start);
+                }
+                t->temporal.scale = (int) scale;
             }
-            int64_t scale;
-            if (!chc__atoi64(num.start, num.len, &scale)
-                || scale < 0 || scale > 9) {
-                chc_type_destroy(t, al);
-                return chc__err_set(err, CHC_ERR_TYPE,
-                    "DateTime64: precision out of range: %.*s",
-                    (int) num.len, num.start);
-            }
-            t->temporal.scale = (int) scale;
             if (chc__peek_tok(lx).kind == CHC__TOK_COMMA) {
                 chc__eat_tok(lx);
                 chc__tok s = chc__eat_tok(lx);

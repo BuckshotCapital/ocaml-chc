@@ -131,6 +131,11 @@ compression and IPv4-mapped `IPv6`. Decimals print in shortest exact form
 (trailing fractional zeros dropped, then the point), which is what both
 `toString` and TSV column output do.
 
+`Interval*` columns decode as `Int` ticks of the type's unit, and
+`Chc.column_interval_unit` says which unit that is: `IntervalDay` and
+`IntervalMillisecond` both report `Kind.Interval` and are told apart only
+there.
+
 `Raw` remains the fallback for anything still unmodelled, holding little-endian
 wire bytes rather than a guess. `JSON`, `Dynamic`, `Variant` and
 `AggregateFunction` are not decodable at all: upstream does not support them in

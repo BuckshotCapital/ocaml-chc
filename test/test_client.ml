@@ -33,6 +33,13 @@ let env k default =
 
 let show = Chc.string_of_value
 
+let contains haystack needle =
+  let n = String.length needle
+  and h = String.length haystack in
+  let rec go i = i + n <= h && (String.sub haystack i n = needle || go (i + 1)) in
+  n = 0 || go 0
+;;
+
 let one_value c sql =
   let _, rows = Chc.Client.query_rows c sql in
   if Array.length rows = 0 then "<no rows>" else show rows.(0).(0)
@@ -59,6 +66,27 @@ let run host =
     si.Chc.Protocol.version_minor
     si.Chc.Protocol.version_patch
     si.Chc.Protocol.revision;
+  (* The server refuses at Hello, before any packet stream exists, so this is
+     the one place a server exception surfaces as a raise instead of a packet. *)
+  print_endline "handshake rejection";
+  (match
+     Chc.Client.connect
+       ~port:(int_of_string (env "CHC_TEST_PORT" "9000"))
+       ~user:(env "CHC_TEST_USER" "default")
+       ~password:(env "CHC_TEST_PASSWORD" "")
+       ~database:"no such database"
+       host
+   with
+   | rejected ->
+     incr failures;
+     print_endline "  FAIL unknown database did not raise";
+     Chc.Client.close rejected
+   | exception Chc.Error e ->
+     check "raises Chc.Error" true;
+     check "carries server_code" (e.Chc.Error.server_code <> 0);
+     check "carries the exception class" (String.length e.Chc.Error.server_name > 0);
+     check "carries the server's text" (contains e.Chc.Error.msg "no such database");
+     Printf.printf "  (server_code %d, %s)\n" e.Chc.Error.server_code e.Chc.Error.server_name);
   print_endline "scalars over the wire";
   check_eq "int" ~expected:"-5" ~actual:(one_value c "SELECT toInt32(-5)");
   check_eq "uint64" ~expected:"42" ~actual:(one_value c "SELECT toUInt64(42)");

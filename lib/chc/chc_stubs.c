@@ -39,26 +39,27 @@
  * mis-decoding every column past the insertion point. */
 _Static_assert(CHC_KIND_COUNT == 55, "chc_kind changed — update Chc.Kind");
 _Static_assert(CHC_COL_NOTHING == 7, "chc_col_kind changed — update Chc.Layout");
+_Static_assert(CHC_INTERVAL_YEAR == 11, "chc_interval_unit changed — update Chc.Interval_unit");
 
 /* -------------------------------------------------------------------------- */
 /* Errors                                                                     */
 /* -------------------------------------------------------------------------- */
 
-static void chc_raise_error(int code, const chc_err *err) {
-    CAMLparam0();
-    CAMLlocal3(rec, msg, srv);
+/* Build the Chc.Error record and raise it. [msg] and [srv] are OCaml strings
+ * the caller has already allocated, so by the time caml_raise_with_arg
+ * longjmps there is no C-owned text left to free. */
+static void chc_raise_record(int code, int server_code, value msg, value srv) {
+    CAMLparam2(msg, srv);
+    CAMLlocal1(rec);
 
     static const value *exn = NULL;
     if (exn == NULL) {
         exn = caml_named_value("chc.error");
     }
 
-    msg = caml_copy_string((err && err->msg[0]) ? err->msg : "unknown error");
-    srv = caml_copy_string(err ? err->server_name : "");
-
     rec = caml_alloc(4, 0);
     Store_field(rec, 0, Val_int(code));
-    Store_field(rec, 1, Val_int(err ? err->server_code : 0));
+    Store_field(rec, 1, Val_int(server_code));
     Store_field(rec, 2, msg);
     Store_field(rec, 3, srv);
 
@@ -69,6 +70,39 @@ static void chc_raise_error(int code, const chc_err *err) {
     }
 
     caml_raise_with_arg(*exn, rec);
+    CAMLnoreturn;
+}
+
+/* Transport, protocol and decode failures. chc_err is text only: server
+ * exceptions travel as chc_exception, never through it. */
+static void chc_raise_error(int code, const chc_err *err) {
+    CAMLparam0();
+    CAMLlocal2(msg, srv);
+
+    msg = caml_copy_string((err && err->msg[0]) ? err->msg : "unknown error");
+    srv = caml_copy_string("");
+    chc_raise_record(code, 0, msg, srv);
+    CAMLnoreturn;
+}
+
+/* A server exception handed back out of band. Only the handshake does this —
+ * query failures arrive on the packet stream as Protocol.Exception. Takes
+ * ownership: the text is copied out and the exception freed before the raise,
+ * since nothing after caml_raise_with_arg would get to. The display text is
+ * whatever length the server sent, not clipped to CHC_ERR_MSG_LEN. */
+static void chc_raise_exception(chc_exception *e, const chc_alloc *al) {
+    CAMLparam0();
+    CAMLlocal2(msg, srv);
+
+    if (e->display_text != NULL && e->display_text_len > 0) {
+        msg = caml_alloc_initialized_string(e->display_text_len, e->display_text);
+    } else {
+        msg = caml_copy_string("server rejected the handshake");
+    }
+    srv = caml_alloc_initialized_string(e->name != NULL ? e->name_len : 0, e->name != NULL ? e->name : "");
+    int server_code = (int) e->code;
+    chc_exception_free(e, al);
+    chc_raise_record(CHC_ERR_SERVER, server_code, msg, srv);
     CAMLnoreturn;
 }
 
@@ -322,6 +356,12 @@ CAMLprim value chc_stub_type_datetime64_scale(value vb, value vt) {
 CAMLprim value chc_stub_type_decimal_scale(value vb, value vt) {
     (void) vb;
     return Val_long((long) chc_type_decimal_scale(Type_ptr(vt)));
+}
+
+/* CHC_INTERVAL_NONE (0) for anything that is not an Interval. */
+CAMLprim value chc_stub_type_interval_unit(value vb, value vt) {
+    (void) vb;
+    return Val_long((long) chc_type_interval_unit(Type_ptr(vt)));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -698,17 +738,24 @@ CAMLprim value chc_stub_async_close(value vh) {
     CAMLreturn(Val_unit);
 }
 
-/* true = handshake complete, false = needs more inbound bytes. */
+/* true = handshake complete, false = needs more inbound bytes. A rejection
+ * comes back as CHC_ERR_SERVER with the exception out of band rather than on
+ * the packet stream, since there is no stream yet; it is raised as Chc.Error
+ * with server_code set, the same shape a failed query gets. */
 CAMLprim value chc_stub_async_handshake(value vh) {
     CAMLparam1(vh);
     chc_async_box *box = async_of(vh);
     chc_err err = {0};
-    int rc = chc_async_handshake(box->c, &err);
+    chc_exception *exc = NULL;
+    int rc = chc_async_handshake(box->c, &exc, &err);
     if (rc == CHC_OK) {
         CAMLreturn(Val_true);
     }
     if (rc == CHC_WOULD_BLOCK) {
         CAMLreturn(Val_false);
+    }
+    if (rc == CHC_ERR_SERVER && exc != NULL) {
+        chc_raise_exception(exc, &box->al);
     }
     chc_raise_error(rc, &err);
     CAMLreturn(Val_false); /* unreachable */
